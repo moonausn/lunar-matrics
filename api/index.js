@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Fixed Adsterra Authentication (X-API-Key)
+// Real Smartlink Names (alias) from Adsterra
 // ============================================
 
 const express = require('express');
@@ -93,10 +93,13 @@ app.get('/api/test', (req, res) => {
     });
 });
 
-// ----- ADSTERRA TEST ENDPOINT (Fixed) -----
+// ----- ADSTERRA TEST ENDPOINT -----
 app.get('/api/test-adsterra', async (req, res) => {
     try {
-        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
+        let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
+        if (!baseUrl.endsWith('/')) {
+            baseUrl += '/';
+        }
         const url = `${baseUrl}smart-links.json`;
         
         console.log('🔄 Testing Adsterra API with X-API-Key header:', url);
@@ -120,10 +123,8 @@ app.get('/api/test-adsterra', async (req, res) => {
         // Show all fields for debugging
         const sample = items.slice(0, 5).map(i => ({
             id: i.id || i.smart_link_id || i.placement_id,
-            name: i.name,
             title: i.title,
-            label: i.label,
-            smartlink_name: i.smartlink_name,
+            alias: i.alias,
             allKeys: Object.keys(i),
         }));
 
@@ -176,18 +177,21 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (FIXED)
+// 6. ADSTERRA API HELPERS (FIXED: uses 'alias' as priority)
 // -----------------------------
 
 /**
- * Fetch ALL Smartlinks from Adsterra with REAL names
+ * Fetch ALL Smartlinks from Adsterra with REAL names (alias)
  * ✅ Correct URL: https://api3.adsterratools.com/publisher/smart-links.json
  * ✅ Correct Auth: X-API-Key header
+ * ✅ Name extraction prioritizes 'alias' over 'title'
  */
 const fetchSmartlinksFromAdsterra = async () => {
-    const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
-    const endpoint = 'smart-links.json';
-    const url = `${baseUrl}${endpoint}`;
+    let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
+    if (!baseUrl.endsWith('/')) {
+        baseUrl += '/';
+    }
+    const url = `${baseUrl}smart-links.json`;
 
     console.log(`🔄 Fetching real smartlinks from: ${url} using X-API-Key`);
 
@@ -221,10 +225,10 @@ const fetchSmartlinksFromAdsterra = async () => {
             console.warn('⚠️ Adsterra returned 0 smartlinks');
         }
 
-        // Enhanced name extraction
+        // ✅ FIXED: Prioritize 'alias' (your actual campaign names) over 'title'
         const mapped = items.map(item => {
-            // Try multiple fields for name
-            let name = item.name || item.title || item.label || item.smartlink_name || '';
+            // Priority: alias → name → title → label → smartlink_name
+            let name = item.alias || item.name || item.title || item.label || item.smartlink_name || '';
             
             // If still empty, try to find any string field with "name" in it
             if (!name) {
@@ -264,9 +268,11 @@ const fetchSmartlinksFromAdsterra = async () => {
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
-        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
-        const endpoint = 'stats.json';
-        const url = `${baseUrl}${endpoint}`;
+        let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
+        if (!baseUrl.endsWith('/')) {
+            baseUrl += '/';
+        }
+        const url = `${baseUrl}stats.json`;
 
         const params = {
             from: dateFrom,
@@ -396,8 +402,8 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
         res.json(smartlinks);
     } catch (error) {
         console.error('Smartlinks fetch error:', error.message);
-        res.status(500).json({ 
-            message: 'Failed to fetch real data from Adsterra', 
+        res.status(500).json({
+            message: 'Failed to fetch real data from Adsterra',
             error: error.message,
         });
     }
@@ -622,8 +628,8 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
         });
     } catch (error) {
         console.error('Fix names error:', error);
-        res.status(500).json({ 
-            message: 'Failed to fix names', 
+        res.status(500).json({
+            message: 'Failed to fix names',
             error: error.message,
         });
     }
