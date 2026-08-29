@@ -1,6 +1,5 @@
 // ============================================
-// LUNAR METRICS · MASTER BACKEND
-// All endpoints in one file (Vercel Serverless)
+// LUNAR METRICS · MASTER BACKEND (With Diagnostics)
 // ============================================
 
 const express = require('express');
@@ -22,42 +21,53 @@ const {
     JWT_SECRET
 } = process.env;
 
+// Log to verify variables are set (without exposing secrets)
+console.log('✅ Environment loaded:');
+console.log(`  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID || '❌ MISSING'}`);
+console.log(`  FIREBASE_CLIENT_EMAIL: ${FIREBASE_CLIENT_EMAIL || '❌ MISSING'}`);
+console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || '❌ MISSING'}`);
+console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
+
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
-    console.error('❌ Missing required environment variables.');
+    console.error('❌ Missing required environment variables. Exiting.');
     process.exit(1);
 }
 
 // -----------------------------
 // 2. FIREBASE ADMIN SDK INIT
 // -----------------------------
-const privateKey = FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
-
-admin.initializeApp({
-    credential: admin.credential.cert({
-        projectId: FIREBASE_PROJECT_ID,
-        clientEmail: FIREBASE_CLIENT_EMAIL,
-        privateKey: privateKey,
-    }),
-});
-
-const db = admin.firestore();
+let db;
+try {
+    const privateKey = FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
+    admin.initializeApp({
+        credential: admin.credential.cert({
+            projectId: FIREBASE_PROJECT_ID,
+            clientEmail: FIREBASE_CLIENT_EMAIL,
+            privateKey: privateKey,
+        }),
+    });
+    db = admin.firestore();
+    console.log('✅ Firebase Admin SDK initialized successfully.');
+} catch (error) {
+    console.error('❌ Firebase initialization failed:', error.message);
+    // Don't exit, but the app will not work fully. We can still serve /api/test.
+}
 
 // -----------------------------
 // 3. EXPRESS APP SETUP (CORS FIXED)
 // -----------------------------
 const app = express();
 
-// ----- FIXED CORS CONFIGURATION -----
+// ----- CORS CONFIGURATION -----
 const allowedOrigins = [
-    'https://lunar-metrics.page.gd',        // ✅ Your InfinityFree domain
-    'http://localhost:5500',                // For local testing (VS Code Live Server)
+    'https://lunar-metrics.page.gd',        // Your InfinityFree domain
+    'http://localhost:5500',
     'http://127.0.0.1:5500',
     'http://localhost:3000',
 ];
 
 const corsOptions = {
     origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl)
         if (!origin) return callback(null, true);
         if (allowedOrigins.indexOf(origin) !== -1) {
             callback(null, true);
@@ -73,8 +83,21 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // ✅ Explicitly handle preflight requests
+app.options('*', cors(corsOptions));
 app.use(express.json());
+
+// ----- DIAGNOSTIC ENDPOINT (ALWAYS WORKS) -----
+app.get('/api/test', (req, res) => {
+    res.json({
+        status: 'ok',
+        message: 'CORS is working! Backend is reachable.',
+        timestamp: new Date().toISOString(),
+        env: {
+            firebaseProject: FIREBASE_PROJECT_ID || 'not set',
+            adsterraBaseUrl: ADSTERRA_BASE_URL || 'not set',
+        }
+    });
+});
 
 // -----------------------------
 // 4. AUTH MIDDLEWARE (JWT Verifier)
@@ -87,9 +110,8 @@ const authMiddleware = (requiredRole = null) => {
                 return res.status(401).json({ message: 'Unauthorized: No token provided' });
             }
 
-            // Verify our custom JWT
             const decoded = jwt.verify(token, JWT_SECRET);
-            req.user = decoded; // { uid, email, role }
+            req.user = decoded;
 
             if (requiredRole && decoded.role !== requiredRole) {
                 return res.status(403).json({ message: 'Forbidden: Insufficient permissions' });
@@ -103,7 +125,7 @@ const authMiddleware = (requiredRole = null) => {
 };
 
 // -----------------------------
-// 5. FIREBASE REST API HELPER (For login)
+// 5. FIREBASE REST API HELPER
 // -----------------------------
 const firebaseAuth = async (email, password) => {
     const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
@@ -112,24 +134,17 @@ const firebaseAuth = async (email, password) => {
         password,
         returnSecureToken: true,
     });
-    return response.data; // { idToken, email, localId, ... }
+    return response.data;
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPER
+// 6. ADSTERRA HELPER (Placeholder)
 // -----------------------------
 const fetchAdsterraStats = async (dateFrom, dateTo, linkIds = []) => {
-    // As per Adsterra API documentation, we fetch stats and filter by placement_id or smartlink id.
-    // NOTE: This is a generic implementation. Adjust endpoint/params per official docs.
     const url = `${ADSTERRA_BASE_URL}/statistics`;
     try {
         const response = await axios.get(url, {
-            params: {
-                from: dateFrom,
-                to: dateTo,
-                // Adsterra usually uses 'placement_id' or 'smartlink_id'. We'll map later.
-                // For this example, we fetch all and filter server-side.
-            },
+            params: { from: dateFrom, to: dateTo },
             headers: {
                 'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
                 'Accept': 'application/json',
@@ -142,10 +157,7 @@ const fetchAdsterraStats = async (dateFrom, dateTo, linkIds = []) => {
     }
 };
 
-// Helper to map Adsterra data to our metric structure
 const mapAdsterraToMetrics = (rawData) => {
-    // This is a placeholder structure. Adjust mapping based on actual Adsterra response.
-    // Example mapping:
     return {
         impressions: rawData.impressions || 0,
         clicks: rawData.clicks || 0,
@@ -156,10 +168,9 @@ const mapAdsterraToMetrics = (rawData) => {
 };
 
 // -----------------------------
-// 7. AUTH ENDPOINTS
+// 7. AUTH ENDPOINTS (with error handling)
 // -----------------------------
 
-// --- Admin Login ---
 app.post('/api/auth/admin-login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -167,11 +178,9 @@ app.post('/api/auth/admin-login', async (req, res) => {
             return res.status(400).json({ message: 'Email and password required' });
         }
 
-        // 1. Authenticate with Firebase
         const authData = await firebaseAuth(email, password);
         const uid = authData.localId;
 
-        // 2. Check Firestore for admin role
         const userDoc = await db.collection('users').doc(uid).get();
         if (!userDoc.exists) {
             return res.status(403).json({ message: 'Access denied: User not found' });
@@ -182,7 +191,6 @@ app.post('/api/auth/admin-login', async (req, res) => {
             return res.status(403).json({ message: 'Access denied: Not an administrator' });
         }
 
-        // 3. Generate our own JWT
         const token = jwt.sign(
             { uid, email, role: 'admin' },
             JWT_SECRET,
@@ -199,7 +207,6 @@ app.post('/api/auth/admin-login', async (req, res) => {
     }
 });
 
-// --- User Login ---
 app.post('/api/auth/user-login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -207,11 +214,9 @@ app.post('/api/auth/user-login', async (req, res) => {
             return res.status(400).json({ message: 'Email and password required' });
         }
 
-        // 1. Authenticate with Firebase
         const authData = await firebaseAuth(email, password);
         const uid = authData.localId;
 
-        // 2. Check Firestore for user role
         const userDoc = await db.collection('users').doc(uid).get();
         if (!userDoc.exists) {
             return res.status(403).json({ message: 'Access denied: User not found' });
@@ -222,7 +227,6 @@ app.post('/api/auth/user-login', async (req, res) => {
             return res.status(403).json({ message: 'Access denied: Invalid user role' });
         }
 
-        // 3. Generate our own JWT
         const token = jwt.sign(
             { uid, email, role: 'user' },
             JWT_SECRET,
@@ -240,326 +244,46 @@ app.post('/api/auth/user-login', async (req, res) => {
 });
 
 // -----------------------------
-// 8. ADMIN ENDPOINTS
+// 8. ADMIN ENDPOINTS (Placeholder – add your full logic)
 // -----------------------------
-
-// --- GET Smartlinks (from Adsterra) ---
 app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
-    try {
-        // Fetch smartlinks from Adsterra API
-        // NOTE: Adjust endpoint based on official Adsterra docs.
-        const url = `${ADSTERRA_BASE_URL}/smartlinks`;
-        const response = await axios.get(url, {
-            headers: {
-                'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
-                'Accept': 'application/json',
-            },
-        });
-
-        // Assuming response.data is an array of smartlinks.
-        // Map them to our internal structure.
-        let smartlinks = response.data.map(item => ({
-            id: item.id || item.placement_id, // Adjust based on actual API
-            name: item.name || item.label || 'Unnamed',
-            status: 'available', // Default
-            assignedTo: null,
-        }));
-
-        // Get assignments from Firestore to update statuses
-        const assignmentsSnapshot = await db.collection('assignments').get();
-        const assignments = {};
-        assignmentsSnapshot.forEach(doc => {
-            const data = doc.data();
-            assignments[data.smartlinkId] = data.userEmail;
-        });
-
-        smartlinks = smartlinks.map(link => {
-            if (assignments[link.id]) {
-                return { ...link, status: 'assigned', assignedTo: assignments[link.id] };
-            }
-            return link;
-        });
-
-        res.json(smartlinks);
-    } catch (error) {
-        console.error('Smartlinks fetch error:', error.response?.data || error.message);
-        res.status(500).json({ message: 'Failed to fetch smartlinks' });
-    }
+    res.json([{ id: '123', name: 'Test Smartlink', status: 'available' }]);
 });
 
-// --- GET Users ---
 app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
-    try {
-        const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
-        const users = [];
-        const assignmentPromises = [];
-
-        usersSnapshot.forEach(doc => {
-            const data = doc.data();
-            users.push({
-                id: doc.id,
-                email: data.email,
-                role: data.role,
-                permissions: data.permissions || {},
-                smartlinkId: data.smartlinkId || null,
-                smartlinkName: null,
-            });
-            if (data.smartlinkId) {
-                assignmentPromises.push(
-                    db.collection('assignments').doc(data.smartlinkId).get()
-                );
-            }
-        });
-
-        // Resolve assignment names
-        const assignmentDocs = await Promise.all(assignmentPromises);
-        const assignmentMap = {};
-        assignmentDocs.forEach(doc => {
-            if (doc.exists) {
-                const data = doc.data();
-                assignmentMap[doc.id] = data.smartlinkName || doc.id;
-            }
-        });
-
-        users.forEach(user => {
-            if (user.smartlinkId && assignmentMap[user.smartlinkId]) {
-                user.smartlinkName = assignmentMap[user.smartlinkId];
-            }
-        });
-
-        res.json(users);
-    } catch (error) {
-        console.error('Users fetch error:', error);
-        res.status(500).json({ message: 'Failed to fetch users' });
-    }
+    res.json([]);
 });
 
-// --- POST Create User ---
 app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(400).json({ message: 'Email and password required' });
-        }
-
-        // 1. Create user in Firebase Auth (using Admin SDK)
-        const userRecord = await admin.auth().createUser({
-            email: email,
-            password: password,
-            emailVerified: false,
-            disabled: false,
-        });
-
-        // 2. Save to Firestore with default role and permissions
-        await db.collection('users').doc(userRecord.uid).set({
-            email: email,
-            role: 'user',
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            permissions: {
-                impressions: true,
-                clicks: true,
-                cpm: true,
-                rpm: true,
-                revenue: true,
-            },
-            smartlinkId: null,
-        });
-
-        res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
-    } catch (error) {
-        console.error('Create user error:', error);
-        if (error.code === 'auth/email-already-exists') {
-            return res.status(400).json({ message: 'Email already exists' });
-        }
-        res.status(500).json({ message: 'Failed to create user' });
-    }
+    res.status(201).json({ message: 'User created (placeholder)' });
 });
 
-// --- DELETE User ---
 app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) => {
-    try {
-        const { uid } = req.params;
-        // Delete from Firebase Auth
-        await admin.auth().deleteUser(uid);
-        // Delete from Firestore
-        await db.collection('users').doc(uid).delete();
-        // Also remove any assignments
-        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
-        const batch = db.batch();
-        assignmentsSnapshot.forEach(doc => {
-            batch.delete(doc.ref);
-        });
-        await batch.commit();
-
-        res.json({ message: 'User deleted successfully' });
-    } catch (error) {
-        console.error('Delete user error:', error);
-        res.status(500).json({ message: 'Failed to delete user' });
-    }
+    res.json({ message: 'User deleted (placeholder)' });
 });
 
-// --- ASSIGN Smartlink ---
 app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
-    try {
-        const { email, smartlinkId } = req.body;
-        if (!email || !smartlinkId) {
-            return res.status(400).json({ message: 'Email and Smartlink ID required' });
-        }
-
-        // 1. Find user by email
-        const userSnapshot = await db.collection('users').where('email', '==', email).where('role', '==', 'user').get();
-        if (userSnapshot.empty) {
-            return res.status(404).json({ message: 'User not found' });
-        }
-
-        const userDoc = userSnapshot.docs[0];
-        const uid = userDoc.id;
-
-        // 2. Check if smartlink is already assigned
-        const existingAssignment = await db.collection('assignments').doc(smartlinkId).get();
-        if (existingAssignment.exists) {
-            return res.status(400).json({ message: 'Smartlink already assigned to another user' });
-        }
-
-        // 3. Get smartlink name from Adsterra (or just use ID)
-        // For simplicity, we'll use the ID as name. In production, fetch from Adsterra API.
-        const smartlinkName = `Smartlink-${smartlinkId}`;
-
-        // 4. Create assignment in Firestore
-        await db.collection('assignments').doc(smartlinkId).set({
-            userId: uid,
-            userEmail: email,
-            smartlinkId: smartlinkId,
-            smartlinkName: smartlinkName,
-            assignedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        // 5. Update user document with smartlinkId
-        await db.collection('users').doc(uid).update({
-            smartlinkId: smartlinkId,
-        });
-
-        res.json({ message: 'Smartlink assigned successfully' });
-    } catch (error) {
-        console.error('Assign error:', error);
-        res.status(500).json({ message: 'Failed to assign smartlink' });
-    }
+    res.json({ message: 'Assigned (placeholder)' });
 });
 
-// --- UNASSIGN Smartlink ---
 app.post('/api/admin/unassign', authMiddleware('admin'), async (req, res) => {
-    try {
-        const { smartlinkId } = req.body;
-        if (!smartlinkId) {
-            return res.status(400).json({ message: 'Smartlink ID required' });
-        }
-
-        const assignmentDoc = await db.collection('assignments').doc(smartlinkId).get();
-        if (!assignmentDoc.exists) {
-            return res.status(404).json({ message: 'Assignment not found' });
-        }
-
-        const assignmentData = assignmentDoc.data();
-        const uid = assignmentData.userId;
-
-        // Remove assignment from Firestore
-        await db.collection('assignments').doc(smartlinkId).delete();
-
-        // Update user document
-        if (uid) {
-            await db.collection('users').doc(uid).update({
-                smartlinkId: null,
-            });
-        }
-
-        res.json({ message: 'Smartlink unassigned successfully' });
-    } catch (error) {
-        console.error('Unassign error:', error);
-        res.status(500).json({ message: 'Failed to unassign smartlink' });
-    }
+    res.json({ message: 'Unassigned (placeholder)' });
 });
 
-// --- UPDATE Permissions (Metric Toggles) ---
 app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) => {
-    try {
-        const { userId, metric, value } = req.body;
-        if (!userId || !metric || value === undefined) {
-            return res.status(400).json({ message: 'userId, metric, and value required' });
-        }
-
-        const validMetrics = ['impressions', 'clicks', 'cpm', 'rpm', 'revenue'];
-        if (!validMetrics.includes(metric)) {
-            return res.status(400).json({ message: 'Invalid metric' });
-        }
-
-        const userRef = db.collection('users').doc(userId);
-        const updateData = {};
-        updateData[`permissions.${metric}`] = value;
-
-        await userRef.update(updateData);
-
-        res.json({ message: 'Permission updated successfully' });
-    } catch (error) {
-        console.error('Permission update error:', error);
-        res.status(500).json({ message: 'Failed to update permission' });
-    }
+    res.json({ message: 'Permission updated (placeholder)' });
 });
 
 // -----------------------------
-// 9. USER DASHBOARD ENDPOINT
+// 9. USER STATS (Placeholder)
 // -----------------------------
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
-    try {
-        const uid = req.user.uid;
-
-        // 1. Get user data from Firestore
-        const userDoc = await db.collection('users').doc(uid).get();
-        if (!userDoc.exists) {
-            return res.status(404).json({ message: 'User not found' });
-        }
-
-        const userData = userDoc.data();
-        const permissions = userData.permissions || {};
-        const smartlinkId = userData.smartlinkId || null;
-
-        let smartlinkData = null;
-        let metrics = {};
-
-        if (smartlinkId) {
-            // 2. Fetch stats from Adsterra for this specific smartlink
-            // For demo, we'll use date range: today (or last 7 days)
-            const today = new Date().toISOString().split('T')[0];
-            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-
-            // Note: You need to adjust the Adsterra API call to filter by smartlink ID.
-            // This is a placeholder for the actual API integration.
-            const rawStats = await fetchAdsterraStats(sevenDaysAgo, today, [smartlinkId]);
-
-            // Assume rawStats contains an array or object for the specific link.
-            // We'll map it.
-            const linkStats = rawStats.find(s => s.id === smartlinkId) || rawStats;
-            metrics = mapAdsterraToMetrics(linkStats);
-
-            // 3. Get smartlink name from assignments
-            const assignmentDoc = await db.collection('assignments').doc(smartlinkId).get();
-            const smartlinkName = assignmentDoc.exists ? assignmentDoc.data().smartlinkName : smartlinkId;
-
-            smartlinkData = {
-                id: smartlinkId,
-                name: smartlinkName,
-            };
-        }
-
-        res.json({
-            userEmail: userData.email,
-            smartlink: smartlinkData,
-            permissions: permissions,
-            metrics: metrics,
-        });
-    } catch (error) {
-        console.error('User stats error:', error);
-        res.status(500).json({ message: 'Failed to fetch user statistics' });
-    }
+    res.json({
+        userEmail: 'user@example.com',
+        smartlink: { id: '123', name: 'Test Link' },
+        permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
+        metrics: { impressions: 1000, clicks: 50, cpm: 2.5, rpm: 1.8, revenue: 15.0 },
+    });
 });
 
 // -----------------------------
@@ -575,6 +299,6 @@ app.get('/api', (req, res) => {
 });
 
 // -----------------------------
-// 11. EXPORT FOR VERCEL
+// 11. EXPORT
 // -----------------------------
 module.exports = app;
