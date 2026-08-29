@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Real Smartlink Names from Adsterra
+// REAL DATA ONLY – No Mockup/Fallback
 // ============================================
 
 const express = require('express');
@@ -25,6 +25,7 @@ const {
 console.log('✅ Environment loaded:');
 console.log(`  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID || '❌ MISSING'}`);
 console.log(`  ADSTERRA_API_KEY: ${ADSTERRA_API_KEY ? '✅ Set' : '❌ MISSING'}`);
+console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || 'https://api3.adsterratools.com'}`);
 console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
@@ -92,6 +93,46 @@ app.get('/api/test', (req, res) => {
     });
 });
 
+// ----- ADSTERRA TEST ENDPOINT (Debugging) -----
+app.get('/api/test-adsterra', async (req, res) => {
+    try {
+        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
+        const url = `${baseUrl}/publisher/smart-links.json?api_key=${ADSTERRA_API_KEY}`;
+        
+        console.log('🔄 Testing Adsterra API:', url);
+        const response = await axios.get(url, {
+            headers: { 'Accept': 'application/json' },
+            timeout: 15000,
+        });
+        
+        let items = [];
+        if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
+            items = response.data.data.items;
+        } else if (response.data && Array.isArray(response.data)) {
+            items = response.data;
+        } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
+            items = response.data.items;
+        }
+
+        res.json({
+            success: true,
+            count: items.length,
+            sample: items.slice(0, 5).map(i => ({
+                id: i.id || i.smart_link_id || i.placement_id,
+                name: i.name || i.title || i.label
+            })),
+            fullData: response.data,
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.response?.data || error.message,
+            status: error.response?.status,
+            message: 'Adsterra API call failed. Check your API key.',
+        });
+    }
+});
+
 // -----------------------------
 // 4. AUTH MIDDLEWARE
 // -----------------------------
@@ -124,88 +165,63 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS
+// 6. ADSTERRA API HELPERS (REAL ONLY – NO MOCKUP)
 // -----------------------------
 
 /**
- * Fetch ALL Smartlinks from Adsterra with real names
+ * Fetch ALL Smartlinks from Adsterra with REAL names
+ * ✅ NO FALLBACK – throws error if API fails
+ * ✅ Uses api_key as query parameter (per Adsterra docs)
  */
 const fetchSmartlinksFromAdsterra = async () => {
     const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
     const endpoint = '/publisher/smart-links.json';
     const url = `${baseUrl}${endpoint}`;
 
-    const authMethods = [
-        {
-            name: 'query-api_key',
-            config: {
-                params: { api_key: ADSTERRA_API_KEY },
-                headers: { 'Accept': 'application/json' }
-            }
-        },
-        {
-            name: 'query-key',
-            config: {
-                params: { key: ADSTERRA_API_KEY },
-                headers: { 'Accept': 'application/json' }
-            }
-        },
-        {
-            name: 'bearer',
-            config: {
-                headers: { 
-                    'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
-                    'Accept': 'application/json'
-                }
-            }
-        },
-        {
-            name: 'header-X-API-Key',
-            config: {
-                headers: { 
-                    'X-API-Key': ADSTERRA_API_KEY,
-                    'Accept': 'application/json'
-                }
-            }
-        },
-    ];
+    const params = {
+        api_key: ADSTERRA_API_KEY,
+    };
 
-    for (const method of authMethods) {
-        try {
-            console.log(`🔄 Trying auth method: ${method.name}`);
-            const response = await axios.get(url, method.config);
+    console.log(`🔄 Fetching REAL smartlinks from Adsterra: ${url}`);
 
-            if (response.status === 200) {
-                console.log(`✅ Success with method: ${method.name}`);
-                
-                let items = [];
-                if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
-                    items = response.data.data.items;
-                } else if (response.data && Array.isArray(response.data)) {
-                    items = response.data;
-                } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
-                    items = response.data.items;
-                } else if (response.data && response.data.result && Array.isArray(response.data.result)) {
-                    items = response.data.result;
-                } else {
-                    items = [];
-                }
+    try {
+        const response = await axios.get(url, {
+            params: params,
+            headers: { 'Accept': 'application/json' },
+            timeout: 15000,
+        });
 
-                console.log(`✅ Fetched ${items.length} smartlinks from Adsterra.`);
-                
-                return items.map(item => ({
-                    id: item.id || item.smart_link_id || item.placement_id || String(item),
-                    name: item.name || item.title || item.label || 'Unnamed',
-                }));
-            }
-        } catch (error) {
-            const errorMsg = error.response?.data?.message || error.message;
-            console.warn(`❌ Method ${method.name} failed: ${errorMsg}`);
+        if (response.status !== 200) {
+            throw new Error(`Adsterra returned status ${response.status}`);
         }
-    }
 
-    console.error('❌ All authentication methods failed.');
-    throw new Error('Failed to fetch smartlinks from Adsterra');
+        let items = [];
+        if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
+            items = response.data.data.items;
+        } else if (response.data && Array.isArray(response.data)) {
+            items = response.data;
+        } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
+            items = response.data.items;
+        } else if (response.data && response.data.result && Array.isArray(response.data.result)) {
+            items = response.data.result;
+        } else {
+            throw new Error('Unexpected response structure from Adsterra');
+        }
+
+        if (items.length === 0) {
+            console.warn('⚠️ Adsterra returned 0 smartlinks');
+        }
+
+        console.log(`✅ Fetched ${items.length} smartlinks from Adsterra (REAL DATA)`);
+
+        return items.map(item => ({
+            id: item.id || item.smart_link_id || item.placement_id || String(item),
+            name: item.name || item.title || item.label || item.smartlink_name || '',
+        }));
+    } catch (error) {
+        console.error('❌ Adsterra API error:', error.response?.data || error.message);
+        throw new Error(`Failed to fetch real data from Adsterra: ${error.response?.data?.message || error.message}`);
+    }
 };
 
 /**
@@ -229,6 +245,7 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
         const response = await axios.get(url, {
             params: params,
             headers: { 'Accept': 'application/json' },
+            timeout: 15000,
         });
 
         let statsData = response.data;
@@ -310,24 +327,13 @@ app.post('/api/auth/user-login', async (req, res) => {
 });
 
 // ============================================
-// 8. ADMIN ENDPOINTS
+// 8. ADMIN ENDPOINTS (REAL DATA ONLY)
 // ============================================
 
 app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
     try {
-        let adsterraLinks = [];
-        try {
-            adsterraLinks = await fetchSmartlinksFromAdsterra();
-        } catch (error) {
-            console.warn('⚠️ Adsterra API failed, using fallback mock data.');
-            adsterraLinks = [
-                { id: '30979549', name: 'MN02-D' },
-                { id: '30979548', name: 'MN02-C' },
-                { id: '30979544', name: 'MN02-B' },
-                { id: '30979542', name: 'MN02-A' },
-                { id: '30853036', name: 'Moon' },
-            ];
-        }
+        // ✅ REAL DATA ONLY – NO FALLBACK
+        const adsterraLinks = await fetchSmartlinksFromAdsterra();
 
         // Fetch assignments from Firestore
         const assignmentsSnapshot = await db.collection('assignments').get();
@@ -337,7 +343,7 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
             assignments[data.smartlinkId] = {
                 userEmail: data.userEmail,
                 userId: data.userId,
-                smartlinkName: data.smartlinkName, // Use stored name
+                smartlinkName: data.smartlinkName,
             };
         });
 
@@ -345,8 +351,6 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
             const assigned = assignments[link.id];
             return {
                 ...link,
-                // ✅ Use Adsterra's real name (override stored if available)
-                name: link.name || assigned?.smartlinkName || link.id,
                 status: assigned ? 'assigned' : 'available',
                 assignedTo: assigned ? assigned.userEmail : null,
                 assignedUserId: assigned ? assigned.userId : null,
@@ -356,7 +360,11 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
         res.json(smartlinks);
     } catch (error) {
         console.error('Smartlinks fetch error:', error.message);
-        res.status(500).json({ message: 'Failed to fetch smartlinks', error: error.message });
+        res.status(500).json({ 
+            message: 'Failed to fetch real data from Adsterra', 
+            error: error.message,
+            hint: 'Check your ADSTERRA_API_KEY environment variable.'
+        });
     }
 });
 
@@ -442,7 +450,7 @@ app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) =>
     }
 });
 
-// --- ASSIGN Smartlink (UPDATED: Fetches real name from Adsterra) ---
+// --- ASSIGN Smartlink ---
 app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
     try {
         const { email, smartlinkId } = req.body;
@@ -456,7 +464,7 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
         const existingAssignment = await db.collection('assignments').doc(smartlinkId).get();
         if (existingAssignment.exists) return res.status(400).json({ message: 'Smartlink already assigned' });
 
-        // ✅ Fetch real name from Adsterra
+        // ✅ Fetch REAL name from Adsterra
         let smartlinkName = smartlinkId;
         try {
             const adsterraLinks = await fetchSmartlinksFromAdsterra();
@@ -465,10 +473,10 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
                 smartlinkName = found.name;
                 console.log(`✅ Found real name for ${smartlinkId}: ${smartlinkName}`);
             } else {
-                console.warn(`⚠️ No name found for ${smartlinkId}, using ID as fallback`);
+                console.warn(`⚠️ No name found for ${smartlinkId}, using ID`);
             }
         } catch (error) {
-            console.warn(`⚠️ Could not fetch name from Adsterra, using ID as fallback: ${error.message}`);
+            console.warn(`⚠️ Could not fetch name from Adsterra: ${error.message}`);
             smartlinkName = smartlinkId;
         }
 
@@ -476,7 +484,7 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
             userId: uid,
             userEmail: email,
             smartlinkId,
-            smartlinkName, // ✅ Real name saved
+            smartlinkName,
             assignedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
@@ -543,26 +551,16 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
     try {
         console.log('🔄 Starting name fix for all assignments...');
 
-        // 1. Fetch all smartlinks from Adsterra with real names
-        let adsterraLinks = [];
-        try {
-            adsterraLinks = await fetchSmartlinksFromAdsterra();
-        } catch (error) {
-            return res.status(500).json({ 
-                message: 'Failed to fetch smartlinks from Adsterra', 
-                error: error.message 
-            });
-        }
+        // ✅ Fetch REAL data from Adsterra (NO FALLBACK)
+        const adsterraLinks = await fetchSmartlinksFromAdsterra();
 
-        // Create a map: ID -> Name
         const nameMap = {};
         adsterraLinks.forEach(link => {
             nameMap[link.id] = link.name;
         });
 
-        console.log(`✅ Fetched ${Object.keys(nameMap).length} smartlinks from Adsterra`);
+        console.log(`✅ Fetched ${Object.keys(nameMap).length} real names from Adsterra`);
 
-        // 2. Get all assignments from Firestore
         const assignmentsSnapshot = await db.collection('assignments').get();
         let updatedCount = 0;
         let notFoundCount = 0;
@@ -575,7 +573,6 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
             const realName = nameMap[smartlinkId];
 
             if (realName && realName !== data.smartlinkName) {
-                // Update with real name
                 batch.update(doc.ref, { smartlinkName: realName });
                 updatedCount++;
                 console.log(`✅ Updated ${smartlinkId}: ${data.smartlinkName} → ${realName}`);
@@ -595,12 +592,16 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
         });
     } catch (error) {
         console.error('Fix names error:', error);
-        res.status(500).json({ message: 'Failed to fix names', error: error.message });
+        res.status(500).json({ 
+            message: 'Failed to fix names', 
+            error: error.message,
+            hint: 'Make sure ADSTERRA_API_KEY is valid and Adsterra API is reachable.'
+        });
     }
 });
 
 // ============================================
-// 10. USER STATS (UPDATED)
+// 10. USER STATS
 // ============================================
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
@@ -625,7 +626,6 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
             for (const doc of assignmentsSnapshot.docs) {
                 const assignmentData = doc.data();
                 const smartlinkId = assignmentData.smartlinkId;
-                // ✅ Use stored smartlinkName (which is now real name)
                 const smartlinkName = assignmentData.smartlinkName || smartlinkId;
 
                 try {
