@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Correct Adsterra Smart-Links API Integration
+// All Smartlinks (Active + Inactive) & Stats
 // ============================================
 
 const express = require('express');
@@ -28,7 +28,7 @@ console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || '❌ MISSING (using def
 console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
-    console.error('❌ Missing required environment variables.');
+    console.error('❌ Missing required environment variables. Exiting.');
     process.exit(1);
 }
 
@@ -132,24 +132,23 @@ const firebaseAuth = async (email, password) => {
 // -----------------------------
 
 /**
- * Fetch Smartlinks from Adsterra using correct endpoint
- * Documentation: https://docs.adsterratools.com/public/v3/publishers-api#smartlinks
+ * Fetch ALL Smartlinks from Adsterra (Active + Inactive)
+ * Removed status filter to show all links.
  */
 const fetchSmartlinksFromAdsterra = async () => {
     try {
-        // Use the correct base URL if not set, or use the provided one.
         const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
         const endpoint = '/publisher/smart-links.json';
         const url = `${baseUrl}${endpoint}`;
 
-        // Query parameters: status=3 (Active), traffic_type=1 (Mainstream)
-        // You can adjust these as needed.
+        // ✅ IMPORTANT: Removed "status: 3" to fetch ALL smartlinks (active + inactive)
+        // If you still want to filter by traffic type, keep it.
         const params = {
-            status: 3,    // 3 = Active, 4 = Inactive
-            traffic_type: 1, // 1 = Mainstream, 2 = Adult
+            // status: 0, // 0 = All, 3 = Active, 4 = Inactive – omitting fetches all.
+            traffic_type: 1, // 1 = Mainstream, 2 = Adult – adjust as needed.
         };
 
-        console.log(`🔄 Fetching smartlinks from: ${url} with params:`, params);
+        console.log(`🔄 Fetching ALL smartlinks from: ${url}`);
 
         const response = await axios.get(url, {
             params: params,
@@ -159,42 +158,77 @@ const fetchSmartlinksFromAdsterra = async () => {
             },
         });
 
-        // Expected response: { data: { items: [ { id, name, ... } ] } }
+        // Parse response
         let items = [];
         if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
             items = response.data.data.items;
         } else if (response.data && Array.isArray(response.data)) {
             items = response.data;
+        } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
+            items = response.data.items;
         } else {
             console.warn('Unexpected response structure:', response.data);
             items = [];
         }
 
-        // Map to our internal format
         return items.map(item => ({
             id: item.id || item.smart_link_id || item.placement_id || String(item),
             name: item.name || item.title || item.label || 'Unnamed',
         }));
     } catch (error) {
         console.error('Adsterra Smartlinks fetch error:', error.response?.data || error.message);
-        // If API fails, throw error (will be caught and fallback used)
         throw new Error('Failed to fetch smartlinks from Adsterra');
     }
 };
 
 /**
- * Fetch statistics from Adsterra (placeholder – adjust as per docs)
+ * Fetch statistics for a specific smartlink.
+ * Placeholder – you need to adjust according to actual Adsterra stats endpoint.
+ * Likely endpoint: /publisher/stats.json or /statistics
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
-        // Statistics endpoint might be different. 
-        // For now, we return dummy data if API fails.
-        // You can implement according to official stats endpoint.
-        // Example: https://api3.adsterratools.com/publisher/stats.json?from=...&to=...
-        // But we will just return zeros to avoid breaking the dashboard.
-        return { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
+        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
+        // ⚠️ CHANGE THIS ENDPOINT according to actual Adsterra stats API
+        const endpoint = '/publisher/stats.json';
+        const url = `${baseUrl}${endpoint}`;
+
+        const params = {
+            from: dateFrom,
+            to: dateTo,
+            // Add placement_id or smartlink_id if needed
+        };
+        if (smartlinkId) {
+            params.placement_id = smartlinkId; // or smartlink_id
+        }
+
+        const response = await axios.get(url, {
+            params: params,
+            headers: {
+                'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
+                'Accept': 'application/json',
+            },
+        });
+
+        // Parse response – adjust according to actual structure
+        let statsData = response.data;
+        if (statsData.data && statsData.data.items) {
+            statsData = statsData.data.items;
+        }
+        if (Array.isArray(statsData)) {
+            if (smartlinkId) {
+                const found = statsData.find(item =>
+                    (item.placement_id && item.placement_id == smartlinkId) ||
+                    (item.smartlink_id && item.smartlink_id == smartlinkId)
+                );
+                return found || {};
+            }
+            return statsData.length > 0 ? statsData[0] : {};
+        }
+        return statsData || {};
     } catch (error) {
         console.error('Adsterra Stats fetch error:', error.message);
+        // Return zeros to avoid breaking dashboard
         return { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
     }
 };
@@ -267,7 +301,6 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
             adsterraLinks = await fetchSmartlinksFromAdsterra();
         } catch (error) {
             console.warn('⚠️ Adsterra API failed, using fallback mock data.');
-            // Fallback: Return mock data so admin panel at least shows something
             adsterraLinks = [
                 { id: '30979549', name: 'MN02-D' },
                 { id: '30979548', name: 'MN02-C' },
@@ -470,7 +503,7 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
 });
 
 // ============================================
-// 9. USER STATS (with fallback)
+// 9. USER STATS (with real stats fetch)
 // ============================================
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
@@ -490,12 +523,17 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
             const smartlinkName = assignmentDoc.exists ? assignmentDoc.data().smartlinkName : smartlinkId;
             smartlinkData = { id: smartlinkId, name: smartlinkName };
 
-            // Fetch stats from Adsterra (currently returns zeros)
-            // You can implement real stats endpoint here.
+            // Fetch real stats from Adsterra
             const today = new Date().toISOString().split('T')[0];
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-            const rawStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, smartlinkId);
-            metrics = mapStatsToMetrics(rawStats);
+            
+            try {
+                const rawStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, smartlinkId);
+                metrics = mapStatsToMetrics(rawStats);
+            } catch (error) {
+                console.warn('⚠️ Stats fetch failed, returning zeros');
+                metrics = { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
+            }
         }
 
         res.json({
