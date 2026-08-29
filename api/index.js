@@ -43,10 +43,37 @@ admin.initializeApp({
 const db = admin.firestore();
 
 // -----------------------------
-// 3. EXPRESS APP SETUP
+// 3. EXPRESS APP SETUP (CORS FIXED)
 // -----------------------------
 const app = express();
-app.use(cors({ origin: true }));
+
+// ----- FIXED CORS CONFIGURATION -----
+const allowedOrigins = [
+    'https://lunar-metrics.page.gd',        // ✅ Your InfinityFree domain
+    'http://localhost:5500',                // For local testing (VS Code Live Server)
+    'http://127.0.0.1:5500',
+    'http://localhost:3000',
+];
+
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) !== -1) {
+            callback(null, true);
+        } else {
+            console.warn('Blocked by CORS:', origin);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+    optionsSuccessStatus: 200,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // ✅ Explicitly handle preflight requests
 app.use(express.json());
 
 // -----------------------------
