@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Enhanced Adsterra Fetch with Multiple Auth
+// Enhanced Name Extraction from Adsterra
 // ============================================
 
 const express = require('express');
@@ -114,13 +114,20 @@ app.get('/api/test-adsterra', async (req, res) => {
             items = response.data.items;
         }
 
+        // Show all fields for debugging
+        const sample = items.slice(0, 5).map(i => ({
+            id: i.id || i.smart_link_id || i.placement_id,
+            name: i.name,
+            title: i.title,
+            label: i.label,
+            smartlink_name: i.smartlink_name,
+            allKeys: Object.keys(i),
+        }));
+
         res.json({
             success: true,
             count: items.length,
-            sample: items.slice(0, 5).map(i => ({
-                id: i.id || i.smart_link_id || i.placement_id,
-                name: i.name || i.title || i.label
-            })),
+            sample: sample,
             fullData: response.data,
         });
     } catch (error) {
@@ -166,19 +173,18 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (ENHANCED)
+// 6. ADSTERRA API HELPERS (ENHANCED NAME EXTRACTION)
 // -----------------------------
 
 /**
  * Fetch ALL Smartlinks from Adsterra with REAL names
- * Tries multiple authentication methods, throws error if all fail.
+ * Tries multiple authentication methods
  */
 const fetchSmartlinksFromAdsterra = async () => {
     const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
     const endpoint = '/publisher/smart-links.json';
     const url = `${baseUrl}${endpoint}`;
 
-    // Define multiple authentication methods to try
     const methods = [
         {
             name: 'Query param: api_key',
@@ -256,12 +262,39 @@ const fetchSmartlinksFromAdsterra = async () => {
                     console.warn('⚠️ Adsterra returned 0 smartlinks');
                 }
 
-                console.log(`✅ Fetched ${items.length} smartlinks from Adsterra (REAL DATA)`);
+                // ✅ ENHANCED NAME EXTRACTION
+                const mapped = items.map(item => {
+                    // Try multiple fields for name
+                    let name = item.name || item.title || item.label || item.smartlink_name || '';
+                    
+                    // If still empty, try to find any string field with "name" in it
+                    if (!name) {
+                        for (const key of Object.keys(item)) {
+                            if (key.toLowerCase().includes('name') && typeof item[key] === 'string') {
+                                name = item[key];
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // If still empty, use ID as fallback
+                    if (!name) {
+                        name = item.id || item.smart_link_id || item.placement_id || 'Unnamed';
+                    }
 
-                return items.map(item => ({
-                    id: item.id || item.smart_link_id || item.placement_id || String(item),
-                    name: item.name || item.title || item.label || item.smartlink_name || '',
-                }));
+                    return {
+                        id: item.id || item.smart_link_id || item.placement_id || String(item),
+                        name: name,
+                    };
+                });
+
+                console.log(`✅ Fetched ${mapped.length} smartlinks with names`);
+                // Log first 3 names for verification
+                mapped.slice(0, 3).forEach((link, i) => {
+                    console.log(`  ${i+1}. ${link.id} → ${link.name}`);
+                });
+
+                return mapped;
             }
         } catch (error) {
             lastError = error;
@@ -270,7 +303,6 @@ const fetchSmartlinksFromAdsterra = async () => {
         }
     }
 
-    // All methods failed
     console.error('❌ All authentication methods failed.');
     const detailedError = lastError?.response?.data || lastError?.message || 'Unknown error';
     throw new Error(`Failed to fetch real data from Adsterra: ${detailedError}`);
@@ -379,7 +411,7 @@ app.post('/api/auth/user-login', async (req, res) => {
 });
 
 // ============================================
-// 8. ADMIN ENDPOINTS (REAL DATA ONLY)
+// 8. ADMIN ENDPOINTS
 // ============================================
 
 app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
@@ -414,7 +446,6 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
         res.status(500).json({ 
             message: 'Failed to fetch real data from Adsterra', 
             error: error.message,
-            hint: 'Check ADSTERRA_API_KEY and ADSTERRA_BASE_URL environment variables.'
         });
     }
 });
