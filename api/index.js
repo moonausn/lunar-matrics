@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Real Smartlink Names (alias) from Adsterra
+// Real Smartlink Names (alias) + URL from Adsterra
 // ============================================
 
 const express = require('express');
@@ -120,11 +120,11 @@ app.get('/api/test-adsterra', async (req, res) => {
             items = response.data.items;
         }
 
-        // Show all fields for debugging
         const sample = items.slice(0, 5).map(i => ({
             id: i.id || i.smart_link_id || i.placement_id,
             title: i.title,
             alias: i.alias,
+            url: i.url,
             allKeys: Object.keys(i),
         }));
 
@@ -177,14 +177,15 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (FIXED: uses 'alias' as priority)
+// 6. ADSTERRA API HELPERS (INCLUDES URL)
 // -----------------------------
 
 /**
- * Fetch ALL Smartlinks from Adsterra with REAL names (alias)
+ * Fetch ALL Smartlinks from Adsterra with REAL names (alias) AND URL
  * ✅ Correct URL: https://api3.adsterratools.com/publisher/smart-links.json
  * ✅ Correct Auth: X-API-Key header
  * ✅ Name extraction prioritizes 'alias' over 'title'
+ * ✅ Returns 'url' field for copy link functionality
  */
 const fetchSmartlinksFromAdsterra = async () => {
     let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
@@ -226,11 +227,11 @@ const fetchSmartlinksFromAdsterra = async () => {
         }
 
         // ✅ FIXED: Prioritize 'alias' (your actual campaign names) over 'title'
+        // ✅ ADDED: 'url' field for copy link functionality
         const mapped = items.map(item => {
-            // Priority: alias → name → title → label → smartlink_name
+            // Name extraction
             let name = item.alias || item.name || item.title || item.label || item.smartlink_name || '';
             
-            // If still empty, try to find any string field with "name" in it
             if (!name) {
                 for (const key of Object.keys(item)) {
                     if (key.toLowerCase().includes('name') && typeof item[key] === 'string') {
@@ -240,7 +241,6 @@ const fetchSmartlinksFromAdsterra = async () => {
                 }
             }
             
-            // If still empty, use ID as fallback
             if (!name) {
                 name = item.id || item.smart_link_id || item.placement_id || 'Unnamed';
             }
@@ -248,12 +248,13 @@ const fetchSmartlinksFromAdsterra = async () => {
             return {
                 id: item.id || item.smart_link_id || item.placement_id || String(item),
                 name: name,
+                url: item.url || '', // ✅ ADDED: URL for copy link
             };
         });
 
-        console.log(`✅ Fetched ${mapped.length} smartlinks with names`);
+        console.log(`✅ Fetched ${mapped.length} smartlinks with names and URLs`);
         mapped.slice(0, 3).forEach((link, i) => {
-            console.log(`  ${i+1}. ${link.id} → ${link.name}`);
+            console.log(`  ${i+1}. ${link.id} → ${link.name} → ${link.url ? '✅ URL' : '❌ No URL'}`);
         });
 
         return mapped;
@@ -396,6 +397,7 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
                 status: assigned ? 'assigned' : 'available',
                 assignedTo: assigned ? assigned.userEmail : null,
                 assignedUserId: assigned ? assigned.userId : null,
+                url: link.url || '', // ✅ URL included
             };
         });
 
@@ -529,10 +531,10 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
             smartlinkId: smartlinkId,
         });
 
-        res.json({ message: `Smartlink "${smartlinkName}" assigned successfully` });
+        res.json({ message: `Link "${smartlinkName}" assigned successfully` });
     } catch (error) {
         console.error('Assign error:', error);
-        res.status(500).json({ message: 'Failed to assign smartlink' });
+        res.status(500).json({ message: 'Failed to assign link' });
     }
 });
 
@@ -554,10 +556,10 @@ app.post('/api/admin/unassign', authMiddleware('admin'), async (req, res) => {
             await db.collection('users').doc(uid).update({ smartlinkId: null });
         }
 
-        res.json({ message: 'Smartlink unassigned successfully' });
+        res.json({ message: 'Link unassigned successfully' });
     } catch (error) {
         console.error('Unassign error:', error);
-        res.status(500).json({ message: 'Failed to unassign smartlink' });
+        res.status(500).json({ message: 'Failed to unassign link' });
     }
 });
 
