@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// ALL Smartlinks (No Filters)
+// Correct Adsterra Authentication (api_key)
 // ============================================
 
 const express = require('express');
@@ -25,6 +25,7 @@ const {
 console.log('✅ Environment loaded:');
 console.log(`  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID || '❌ MISSING'}`);
 console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || '❌ MISSING (using default)'}`);
+console.log(`  ADSTERRA_API_KEY: ${ADSTERRA_API_KEY ? '✅ Set' : '❌ MISSING'}`);
 console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
@@ -128,12 +129,12 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (UPDATED - NO FILTERS)
+// 6. ADSTERRA API HELPERS (FIXED AUTH)
 // -----------------------------
 
 /**
  * Fetch ALL Smartlinks from Adsterra
- * ✅ Removed ALL filters (status, traffic_type) to show every link.
+ * ✅ Fixed authentication: uses api_key as query parameter (not Bearer token)
  */
 const fetchSmartlinksFromAdsterra = async () => {
     try {
@@ -141,19 +142,19 @@ const fetchSmartlinksFromAdsterra = async () => {
         const endpoint = '/publisher/smart-links.json';
         const url = `${baseUrl}${endpoint}`;
 
-        // ✅ IMPORTANT: No params = fetch ALL smartlinks (Mainstream + Adult, Active + Inactive)
-        // If you still want to filter, uncomment below lines.
+        // ✅ IMPORTANT: Adsterra API expects api_key as query parameter
+        // https://docs.adsterratools.com/public/v3/publishers-api#smartlinks
         const params = {
+            api_key: ADSTERRA_API_KEY,  // ✅ Authentication via query param
             // status: 3,  // 3=Active, 4=Inactive (omitting fetches all)
             // traffic_type: 1, // 1=Mainstream, 2=Adult (omitting fetches all)
         };
 
-        console.log(`🔄 Fetching ALL smartlinks from: ${url} (no filters)`);
+        console.log(`🔄 Fetching ALL smartlinks from: ${url} (with api_key)`);
 
         const response = await axios.get(url, {
             params: params,
             headers: {
-                'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
                 'Accept': 'application/json',
             },
         });
@@ -194,6 +195,7 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
         const url = `${baseUrl}${endpoint}`;
 
         const params = {
+            api_key: ADSTERRA_API_KEY,
             from: dateFrom,
             to: dateTo,
         };
@@ -204,7 +206,6 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
         const response = await axios.get(url, {
             params: params,
             headers: {
-                'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
                 'Accept': 'application/json',
             },
         });
