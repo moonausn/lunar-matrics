@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Multiple Authentication Methods for Adsterra
+// Multiple Smartlinks per User Support
 // ============================================
 
 const express = require('express');
@@ -23,8 +23,9 @@ const {
 } = process.env;
 
 console.log('✅ Environment loaded:');
+console.log(`  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID || '❌ MISSING'}`);
 console.log(`  ADSTERRA_API_KEY: ${ADSTERRA_API_KEY ? '✅ Set' : '❌ MISSING'}`);
-console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || '❌ MISSING'}`);
+console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
     console.error('❌ Missing required environment variables. Exiting.');
@@ -123,21 +124,20 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (MULTIPLE AUTH)
+// 6. ADSTERRA API HELPERS
 // -----------------------------
 
 /**
  * Fetch ALL Smartlinks from Adsterra
- * ✅ Tries multiple authentication methods
+ * Uses api_key query parameter for authentication
  */
 const fetchSmartlinksFromAdsterra = async () => {
     const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
     const endpoint = '/publisher/smart-links.json';
     const url = `${baseUrl}${endpoint}`;
 
-    // ✅ Multiple authentication methods to try
+    // Multiple authentication methods to try
     const authMethods = [
-        // Method 1: Query parameter (Most common for Adsterra)
         {
             name: 'query-api_key',
             config: {
@@ -145,7 +145,6 @@ const fetchSmartlinksFromAdsterra = async () => {
                 headers: { 'Accept': 'application/json' }
             }
         },
-        // Method 2: Query parameter with 'key'
         {
             name: 'query-key',
             config: {
@@ -153,7 +152,6 @@ const fetchSmartlinksFromAdsterra = async () => {
                 headers: { 'Accept': 'application/json' }
             }
         },
-        // Method 3: Bearer token
         {
             name: 'bearer',
             config: {
@@ -163,7 +161,6 @@ const fetchSmartlinksFromAdsterra = async () => {
                 }
             }
         },
-        // Method 4: X-API-Key header
         {
             name: 'header-X-API-Key',
             config: {
@@ -173,29 +170,7 @@ const fetchSmartlinksFromAdsterra = async () => {
                 }
             }
         },
-        // Method 5: Api-Key header
-        {
-            name: 'header-Api-Key',
-            config: {
-                headers: { 
-                    'Api-Key': ADSTERRA_API_KEY,
-                    'Accept': 'application/json'
-                }
-            }
-        },
-        // Method 6: Authorization header with 'Token' prefix
-        {
-            name: 'header-Token',
-            config: {
-                headers: { 
-                    'Authorization': `Token ${ADSTERRA_API_KEY}`,
-                    'Accept': 'application/json'
-                }
-            }
-        },
     ];
-
-    let lastError = null;
 
     for (const method of authMethods) {
         try {
@@ -205,7 +180,6 @@ const fetchSmartlinksFromAdsterra = async () => {
             if (response.status === 200) {
                 console.log(`✅ Success with method: ${method.name}`);
                 
-                // Parse response
                 let items = [];
                 if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
                     items = response.data.data.items;
@@ -227,19 +201,17 @@ const fetchSmartlinksFromAdsterra = async () => {
                 }));
             }
         } catch (error) {
-            lastError = error;
             const errorMsg = error.response?.data?.message || error.message;
             console.warn(`❌ Method ${method.name} failed: ${errorMsg}`);
         }
     }
 
-    // If all methods fail
-    console.error('❌ All authentication methods failed. Last error:', lastError?.response?.data || lastError?.message);
+    console.error('❌ All authentication methods failed.');
     throw new Error('Failed to fetch smartlinks from Adsterra');
 };
 
 /**
- * Fetch statistics (placeholder – adjust as needed)
+ * Fetch statistics for a specific smartlink
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
@@ -394,22 +366,22 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
         const users = [];
         for (const doc of usersSnapshot.docs) {
             const data = doc.data();
-            let smartlinkName = null;
-            if (data.smartlinkId) {
-                const assignmentDoc = await db.collection('assignments').doc(data.smartlinkId).get();
-                if (assignmentDoc.exists) {
-                    smartlinkName = assignmentDoc.data().smartlinkName || data.smartlinkId;
-                } else {
-                    smartlinkName = data.smartlinkId;
-                }
-            }
+            // Fetch all assigned smartlink names for this user
+            const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', doc.id).get();
+            const smartlinkNames = [];
+            assignmentsSnapshot.forEach(assignmentDoc => {
+                const assignmentData = assignmentDoc.data();
+                smartlinkNames.push(assignmentData.smartlinkName || assignmentData.smartlinkId);
+            });
+
             users.push({
                 id: doc.id,
                 email: data.email,
                 role: data.role,
                 permissions: data.permissions || {},
                 smartlinkId: data.smartlinkId || null,
-                smartlinkName: smartlinkName,
+                smartlinkName: smartlinkNames.length > 0 ? smartlinkNames.join(', ') : null,
+                assignedLinks: smartlinkNames,
             });
         }
         res.json(users);
@@ -498,7 +470,12 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
             smartlinkName,
             assignedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-        await db.collection('users').doc(uid).update({ smartlinkId });
+
+        // Update user document - keep smartlinkId for backward compatibility,
+        // but the source of truth is now the assignments collection.
+        await db.collection('users').doc(uid).update({
+            smartlinkId: smartlinkId,
+        });
 
         res.json({ message: 'Smartlink assigned successfully' });
     } catch (error) {
@@ -517,8 +494,14 @@ app.post('/api/admin/unassign', authMiddleware('admin'), async (req, res) => {
         if (!assignmentDoc.exists) return res.status(404).json({ message: 'Assignment not found' });
 
         const uid = assignmentDoc.data().userId;
+
         await db.collection('assignments').doc(smartlinkId).delete();
-        if (uid) await db.collection('users').doc(uid).update({ smartlinkId: null });
+
+        // Check if user has any other assignments
+        const remainingAssignments = await db.collection('assignments').where('userId', '==', uid).get();
+        if (remainingAssignments.empty) {
+            await db.collection('users').doc(uid).update({ smartlinkId: null });
+        }
 
         res.json({ message: 'Smartlink unassigned successfully' });
     } catch (error) {
@@ -548,43 +531,60 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
 });
 
 // ============================================
-// 9. USER STATS
+// 9. USER STATS (UPDATED - MULTIPLE LINKS)
 // ============================================
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
+
+        // 1. Get user data from Firestore
         const userDoc = await db.collection('users').doc(uid).get();
-        if (!userDoc.exists) return res.status(404).json({ message: 'User not found' });
+        if (!userDoc.exists) {
+            return res.status(404).json({ message: 'User not found' });
+        }
 
         const userData = userDoc.data();
         const permissions = userData.permissions || {};
-        const smartlinkId = userData.smartlinkId || null;
 
-        let smartlinkData = null;
-        let metrics = {};
+        // 2. Get ALL assigned smartlinks for this user from assignments collection
+        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
 
-        if (smartlinkId) {
-            const assignmentDoc = await db.collection('assignments').doc(smartlinkId).get();
-            const smartlinkName = assignmentDoc.exists ? assignmentDoc.data().smartlinkName : smartlinkId;
-            smartlinkData = { id: smartlinkId, name: smartlinkName };
+        const smartlinks = [];
 
+        if (!assignmentsSnapshot.empty) {
             const today = new Date().toISOString().split('T')[0];
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-            
-            try {
-                const rawStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, smartlinkId);
-                metrics = mapStatsToMetrics(rawStats);
-            } catch (error) {
-                console.warn('⚠️ Stats fetch failed, returning zeros');
-                metrics = { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
+
+            for (const doc of assignmentsSnapshot.docs) {
+                const assignmentData = doc.data();
+                const smartlinkId = assignmentData.smartlinkId;
+                const smartlinkName = assignmentData.smartlinkName || smartlinkId;
+
+                try {
+                    const rawStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, smartlinkId);
+                    const metrics = mapStatsToMetrics(rawStats);
+
+                    smartlinks.push({
+                        id: smartlinkId,
+                        name: smartlinkName,
+                        metrics: metrics,
+                    });
+                } catch (error) {
+                    console.warn(`⚠️ Failed to fetch stats for link ${smartlinkId}:`, error.message);
+                    smartlinks.push({
+                        id: smartlinkId,
+                        name: smartlinkName,
+                        metrics: { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 },
+                    });
+                }
             }
         }
 
+        // 3. Return response with ALL links
         res.json({
             userEmail: userData.email,
-            smartlink: smartlinkData,
             permissions: permissions,
-            metrics: metrics,
+            smartlinks: smartlinks,  // ✅ Array of ALL assigned links
         });
     } catch (error) {
         console.error('User stats error:', error);
