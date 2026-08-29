@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// All Smartlinks (Active + Inactive) & Stats
+// ALL Smartlinks (No Filters)
 // ============================================
 
 const express = require('express');
@@ -128,12 +128,12 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (UPDATED)
+// 6. ADSTERRA API HELPERS (UPDATED - NO FILTERS)
 // -----------------------------
 
 /**
- * Fetch ALL Smartlinks from Adsterra (Active + Inactive)
- * Removed status filter to show all links.
+ * Fetch ALL Smartlinks from Adsterra
+ * ✅ Removed ALL filters (status, traffic_type) to show every link.
  */
 const fetchSmartlinksFromAdsterra = async () => {
     try {
@@ -141,14 +141,14 @@ const fetchSmartlinksFromAdsterra = async () => {
         const endpoint = '/publisher/smart-links.json';
         const url = `${baseUrl}${endpoint}`;
 
-        // ✅ IMPORTANT: Removed "status: 3" to fetch ALL smartlinks (active + inactive)
-        // If you still want to filter by traffic type, keep it.
+        // ✅ IMPORTANT: No params = fetch ALL smartlinks (Mainstream + Adult, Active + Inactive)
+        // If you still want to filter, uncomment below lines.
         const params = {
-            // status: 0, // 0 = All, 3 = Active, 4 = Inactive – omitting fetches all.
-            traffic_type: 1, // 1 = Mainstream, 2 = Adult – adjust as needed.
+            // status: 3,  // 3=Active, 4=Inactive (omitting fetches all)
+            // traffic_type: 1, // 1=Mainstream, 2=Adult (omitting fetches all)
         };
 
-        console.log(`🔄 Fetching ALL smartlinks from: ${url}`);
+        console.log(`🔄 Fetching ALL smartlinks from: ${url} (no filters)`);
 
         const response = await axios.get(url, {
             params: params,
@@ -171,6 +171,8 @@ const fetchSmartlinksFromAdsterra = async () => {
             items = [];
         }
 
+        console.log(`✅ Fetched ${items.length} smartlinks from Adsterra.`);
+
         return items.map(item => ({
             id: item.id || item.smart_link_id || item.placement_id || String(item),
             name: item.name || item.title || item.label || 'Unnamed',
@@ -183,8 +185,6 @@ const fetchSmartlinksFromAdsterra = async () => {
 
 /**
  * Fetch statistics for a specific smartlink.
- * Placeholder – you need to adjust according to actual Adsterra stats endpoint.
- * Likely endpoint: /publisher/stats.json or /statistics
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
@@ -196,10 +196,9 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
         const params = {
             from: dateFrom,
             to: dateTo,
-            // Add placement_id or smartlink_id if needed
         };
         if (smartlinkId) {
-            params.placement_id = smartlinkId; // or smartlink_id
+            params.placement_id = smartlinkId;
         }
 
         const response = await axios.get(url, {
@@ -210,7 +209,6 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
             },
         });
 
-        // Parse response – adjust according to actual structure
         let statsData = response.data;
         if (statsData.data && statsData.data.items) {
             statsData = statsData.data.items;
@@ -228,7 +226,6 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
         return statsData || {};
     } catch (error) {
         console.error('Adsterra Stats fetch error:', error.message);
-        // Return zeros to avoid breaking dashboard
         return { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
     }
 };
@@ -399,11 +396,8 @@ app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) =>
         const { uid } = req.params;
         if (!uid) return res.status(400).json({ message: 'User ID required' });
 
-        // Delete from Firebase Auth
         await admin.auth().deleteUser(uid);
-        // Delete from Firestore
         await db.collection('users').doc(uid).delete();
-        // Also remove any assignments
         const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
         const batch = db.batch();
         assignmentsSnapshot.forEach(doc => batch.delete(doc.ref));
@@ -412,7 +406,6 @@ app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) =>
         res.json({ message: 'User deleted successfully' });
     } catch (error) {
         console.error('Delete user error:', error);
-        // If user not found in Auth, still delete from Firestore
         if (error.code === 'auth/user-not-found') {
             try {
                 await db.collection('users').doc(req.params.uid).delete();
@@ -503,7 +496,7 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
 });
 
 // ============================================
-// 9. USER STATS (with real stats fetch)
+// 9. USER STATS
 // ============================================
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
@@ -523,7 +516,6 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
             const smartlinkName = assignmentDoc.exists ? assignmentDoc.data().smartlinkName : smartlinkId;
             smartlinkData = { id: smartlinkId, name: smartlinkName };
 
-            // Fetch real stats from Adsterra
             const today = new Date().toISOString().split('T')[0];
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
             
