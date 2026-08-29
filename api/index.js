@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Correct Adsterra Authentication (api_key)
+// Multiple Authentication Methods for Adsterra
 // ============================================
 
 const express = require('express');
@@ -23,10 +23,8 @@ const {
 } = process.env;
 
 console.log('✅ Environment loaded:');
-console.log(`  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID || '❌ MISSING'}`);
-console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || '❌ MISSING (using default)'}`);
 console.log(`  ADSTERRA_API_KEY: ${ADSTERRA_API_KEY ? '✅ Set' : '❌ MISSING'}`);
-console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
+console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || '❌ MISSING'}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
     console.error('❌ Missing required environment variables. Exiting.');
@@ -90,10 +88,6 @@ app.get('/api/test', (req, res) => {
         status: 'ok',
         message: 'CORS is working! Backend is reachable.',
         timestamp: new Date().toISOString(),
-        env: {
-            firebaseProject: FIREBASE_PROJECT_ID || 'not set',
-            adsterraBaseUrl: ADSTERRA_BASE_URL || 'not set',
-        }
     });
 });
 
@@ -129,68 +123,127 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (FIXED AUTH)
+// 6. ADSTERRA API HELPERS (MULTIPLE AUTH)
 // -----------------------------
 
 /**
  * Fetch ALL Smartlinks from Adsterra
- * ✅ Fixed authentication: uses api_key as query parameter (not Bearer token)
+ * ✅ Tries multiple authentication methods
  */
 const fetchSmartlinksFromAdsterra = async () => {
-    try {
-        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
-        const endpoint = '/publisher/smart-links.json';
-        const url = `${baseUrl}${endpoint}`;
+    const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
+    const endpoint = '/publisher/smart-links.json';
+    const url = `${baseUrl}${endpoint}`;
 
-        // ✅ IMPORTANT: Adsterra API expects api_key as query parameter
-        // https://docs.adsterratools.com/public/v3/publishers-api#smartlinks
-        const params = {
-            api_key: ADSTERRA_API_KEY,  // ✅ Authentication via query param
-            // status: 3,  // 3=Active, 4=Inactive (omitting fetches all)
-            // traffic_type: 1, // 1=Mainstream, 2=Adult (omitting fetches all)
-        };
+    // ✅ Multiple authentication methods to try
+    const authMethods = [
+        // Method 1: Query parameter (Most common for Adsterra)
+        {
+            name: 'query-api_key',
+            config: {
+                params: { api_key: ADSTERRA_API_KEY },
+                headers: { 'Accept': 'application/json' }
+            }
+        },
+        // Method 2: Query parameter with 'key'
+        {
+            name: 'query-key',
+            config: {
+                params: { key: ADSTERRA_API_KEY },
+                headers: { 'Accept': 'application/json' }
+            }
+        },
+        // Method 3: Bearer token
+        {
+            name: 'bearer',
+            config: {
+                headers: { 
+                    'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
+                    'Accept': 'application/json'
+                }
+            }
+        },
+        // Method 4: X-API-Key header
+        {
+            name: 'header-X-API-Key',
+            config: {
+                headers: { 
+                    'X-API-Key': ADSTERRA_API_KEY,
+                    'Accept': 'application/json'
+                }
+            }
+        },
+        // Method 5: Api-Key header
+        {
+            name: 'header-Api-Key',
+            config: {
+                headers: { 
+                    'Api-Key': ADSTERRA_API_KEY,
+                    'Accept': 'application/json'
+                }
+            }
+        },
+        // Method 6: Authorization header with 'Token' prefix
+        {
+            name: 'header-Token',
+            config: {
+                headers: { 
+                    'Authorization': `Token ${ADSTERRA_API_KEY}`,
+                    'Accept': 'application/json'
+                }
+            }
+        },
+    ];
 
-        console.log(`🔄 Fetching ALL smartlinks from: ${url} (with api_key)`);
+    let lastError = null;
 
-        const response = await axios.get(url, {
-            params: params,
-            headers: {
-                'Accept': 'application/json',
-            },
-        });
+    for (const method of authMethods) {
+        try {
+            console.log(`🔄 Trying auth method: ${method.name}`);
+            const response = await axios.get(url, method.config);
 
-        // Parse response
-        let items = [];
-        if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
-            items = response.data.data.items;
-        } else if (response.data && Array.isArray(response.data)) {
-            items = response.data;
-        } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
-            items = response.data.items;
-        } else {
-            console.warn('Unexpected response structure:', response.data);
-            items = [];
+            if (response.status === 200) {
+                console.log(`✅ Success with method: ${method.name}`);
+                
+                // Parse response
+                let items = [];
+                if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
+                    items = response.data.data.items;
+                } else if (response.data && Array.isArray(response.data)) {
+                    items = response.data;
+                } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
+                    items = response.data.items;
+                } else if (response.data && response.data.result && Array.isArray(response.data.result)) {
+                    items = response.data.result;
+                } else {
+                    items = [];
+                }
+
+                console.log(`✅ Fetched ${items.length} smartlinks from Adsterra.`);
+                
+                return items.map(item => ({
+                    id: item.id || item.smart_link_id || item.placement_id || String(item),
+                    name: item.name || item.title || item.label || 'Unnamed',
+                }));
+            }
+        } catch (error) {
+            lastError = error;
+            const errorMsg = error.response?.data?.message || error.message;
+            console.warn(`❌ Method ${method.name} failed: ${errorMsg}`);
         }
-
-        console.log(`✅ Fetched ${items.length} smartlinks from Adsterra.`);
-
-        return items.map(item => ({
-            id: item.id || item.smart_link_id || item.placement_id || String(item),
-            name: item.name || item.title || item.label || 'Unnamed',
-        }));
-    } catch (error) {
-        console.error('Adsterra Smartlinks fetch error:', error.response?.data || error.message);
-        throw new Error('Failed to fetch smartlinks from Adsterra');
     }
+
+    // If all methods fail
+    console.error('❌ All authentication methods failed. Last error:', lastError?.response?.data || lastError?.message);
+    throw new Error('Failed to fetch smartlinks from Adsterra');
 };
 
 /**
- * Fetch statistics for a specific smartlink.
+ * Fetch statistics (placeholder – adjust as needed)
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
         const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
-        // ⚠️ CHANGE THIS ENDPOINT according to actual Adsterra stats API
         const endpoint = '/publisher/stats.json';
         const url = `${baseUrl}${endpoint}`;
 
@@ -205,9 +258,7 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
 
         const response = await axios.get(url, {
             params: params,
-            headers: {
-                'Accept': 'application/json',
-            },
+            headers: { 'Accept': 'application/json' },
         });
 
         let statsData = response.data;
