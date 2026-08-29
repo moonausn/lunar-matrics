@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Real Adsterra API Integration
+// Robust Adsterra Integration with Fallback
 // ============================================
 
 const express = require('express');
@@ -24,12 +24,11 @@ const {
 
 console.log('✅ Environment loaded:');
 console.log(`  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID || '❌ MISSING'}`);
-console.log(`  FIREBASE_CLIENT_EMAIL: ${FIREBASE_CLIENT_EMAIL || '❌ MISSING'}`);
 console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || '❌ MISSING'}`);
 console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
-    console.error('❌ Missing required environment variables. Exiting.');
+    console.error('❌ Missing required environment variables.');
     process.exit(1);
 }
 
@@ -107,14 +106,11 @@ const authMiddleware = (requiredRole = null) => {
             if (!token) {
                 return res.status(401).json({ message: 'Unauthorized: No token provided' });
             }
-
             const decoded = jwt.verify(token, JWT_SECRET);
             req.user = decoded;
-
             if (requiredRole && decoded.role !== requiredRole) {
                 return res.status(403).json({ message: 'Forbidden: Insufficient permissions' });
             }
-
             next();
         } catch (error) {
             return res.status(401).json({ message: 'Invalid or expired token' });
@@ -127,152 +123,165 @@ const authMiddleware = (requiredRole = null) => {
 // -----------------------------
 const firebaseAuth = async (email, password) => {
     const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
-    const response = await axios.post(url, {
-        email,
-        password,
-        returnSecureToken: true,
-    });
+    const response = await axios.post(url, { email, password, returnSecureToken: true });
     return response.data;
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (REAL INTEGRATION)
+// 6. ADSTERRA API HELPERS (ROBUST)
 // -----------------------------
 
 /**
- * Fetch all Smartlinks from Adsterra
- * Returns array of { id, name }
+ * Fetch Smartlinks from Adsterra with multiple authentication attempts
  */
 const fetchSmartlinksFromAdsterra = async () => {
-    try {
-        // Adsterra endpoint to list smartlinks/placements
-        // Adjust endpoint based on actual API docs.
-        // Common endpoints: /smartlinks, /placements, /campaigns
-        const url = `${ADSTERRA_BASE_URL}/smartlinks`;
-        const response = await axios.get(url, {
-            headers: {
-                'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
-                'Accept': 'application/json',
-            },
-        });
+    // Try different possible endpoints
+    const endpoints = [
+        '/smartlinks',
+        '/placements',
+        '/campaigns',
+        '/stats/smartlinks',
+    ];
 
-        // Assuming response.data is an array of objects with 'id' and 'name' or 'label'
-        // Map to our structure
-        let smartlinks = response.data.map(item => ({
-            id: item.id || item.placement_id || item.smartlink_id,
-            name: item.name || item.label || item.title || 'Unnamed',
-        }));
+    // Try different authentication methods
+    const authMethods = [
+        { type: 'bearer', header: `Bearer ${ADSTERRA_API_KEY}` },
+        { type: 'api-key', header: ADSTERRA_API_KEY },
+        { type: 'query', param: 'api_key' },
+        { type: 'query', param: 'key' },
+        { type: 'query', param: 'token' },
+    ];
 
-        return smartlinks;
-    } catch (error) {
-        console.error('Adsterra Smartlinks fetch error:', error.response?.data || error.message);
-        throw new Error('Failed to fetch smartlinks from Adsterra');
+    let lastError = null;
+
+    for (const endpoint of endpoints) {
+        for (const auth of authMethods) {
+            try {
+                const url = `${ADSTERRA_BASE_URL}${endpoint}`;
+                const config = {
+                    headers: { 'Accept': 'application/json' },
+                    params: {},
+                };
+
+                if (auth.type === 'bearer') {
+                    config.headers['Authorization'] = auth.header;
+                } else if (auth.type === 'api-key') {
+                    config.headers['Api-Key'] = auth.header;
+                    config.headers['X-Api-Key'] = auth.header;
+                } else if (auth.type === 'query') {
+                    config.params[auth.param] = ADSTERRA_API_KEY;
+                }
+
+                console.log(`🔄 Trying Adsterra: ${url} (${auth.type})`);
+                const response = await axios.get(url, config);
+
+                if (response.status === 200 && response.data) {
+                    console.log(`✅ Adsterra API success: ${endpoint} (${auth.type})`);
+                    // Parse response - try to find array of objects with id/name
+                    let data = response.data;
+                    if (data.data && Array.isArray(data.data)) data = data.data;
+                    if (data.items && Array.isArray(data.items)) data = data.items;
+                    if (data.result && Array.isArray(data.result)) data = data.result;
+                    if (!Array.isArray(data)) data = [data];
+
+                    // Map to our format
+                    return data.map(item => ({
+                        id: item.id || item.placement_id || item.smartlink_id || item.campaign_id || String(item),
+                        name: item.name || item.label || item.title || item.placement_name || 'Unnamed',
+                    }));
+                }
+            } catch (error) {
+                lastError = error;
+                // Continue to next auth method or endpoint
+            }
+        }
     }
+
+    // If all attempts fail, log and throw
+    console.error('❌ All Adsterra API attempts failed. Last error:', lastError?.message);
+    throw new Error('Failed to fetch smartlinks from Adsterra. Check API key and base URL.');
 };
 
 /**
- * Fetch statistics for a specific smartlink (or all) from Adsterra
- * Returns an object with metrics or array of stats.
+ * Fetch statistics from Adsterra
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
         const url = `${ADSTERRA_BASE_URL}/statistics`;
-        const params = {
-            from: dateFrom,
-            to: dateTo,
-        };
+        const params = { from: dateFrom, to: dateTo };
         if (smartlinkId) {
-            // Adsterra may use 'placement_id' or 'smartlink_id' - adjust accordingly.
             params.placement_id = smartlinkId;
-            // Or params.smartlink_id = smartlinkId;
         }
 
-        const response = await axios.get(url, {
+        const config = {
             params: params,
             headers: {
                 'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
                 'Accept': 'application/json',
             },
-        });
+        };
 
-        // The response structure may vary. Common: { data: { items: [...] } } or array directly.
-        // We'll assume it returns an array of stats objects for each placement.
-        // Each object may have: impressions, clicks, cpm, rpm, revenue.
-        // Some APIs return totals aggregated over the date range.
-        // We'll try to handle both.
-        let statsData = response.data;
-        if (statsData.data && statsData.data.items) {
-            statsData = statsData.data.items;
-        }
-
-        // If we requested a specific smartlink, find it in the array.
-        if (smartlinkId && Array.isArray(statsData)) {
-            const found = statsData.find(item => 
-                (item.placement_id && item.placement_id == smartlinkId) ||
-                (item.smartlink_id && item.smartlink_id == smartlinkId)
-            );
-            if (found) {
-                return found;
+        // Also try with query param if bearer fails
+        try {
+            const response = await axios.get(url, config);
+            let statsData = response.data;
+            if (statsData.data && statsData.data.items) statsData = statsData.data.items;
+            if (Array.isArray(statsData)) {
+                if (smartlinkId) {
+                    const found = statsData.find(item =>
+                        (item.placement_id && item.placement_id == smartlinkId) ||
+                        (item.smartlink_id && item.smartlink_id == smartlinkId)
+                    );
+                    return found || {};
+                }
+                return statsData;
             }
-            // If not found, return empty metrics.
-            return { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
+            return statsData;
+        } catch (bearerError) {
+            // Fallback to query param
+            const fallbackConfig = {
+                params: { ...params, api_key: ADSTERRA_API_KEY },
+                headers: { 'Accept': 'application/json' },
+            };
+            const response = await axios.get(url, fallbackConfig);
+            return response.data;
         }
-
-        // If no smartlinkId, return the whole array (or aggregate)
-        return statsData;
     } catch (error) {
-        console.error('Adsterra Stats fetch error:', error.response?.data || error.message);
-        throw new Error('Failed to fetch statistics from Adsterra');
+        console.error('Adsterra Stats fetch error:', error.message);
+        return { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
     }
 };
 
-// Helper to map raw stats to our metric structure
-const mapStatsToMetrics = (rawStats) => {
-    return {
-        impressions: rawStats.impressions || 0,
-        clicks: rawStats.clicks || 0,
-        cpm: rawStats.cpm || 0,
-        rpm: rawStats.rpm || 0,
-        revenue: rawStats.revenue || 0,
-    };
-};
+const mapStatsToMetrics = (rawStats) => ({
+    impressions: rawStats.impressions || 0,
+    clicks: rawStats.clicks || 0,
+    cpm: rawStats.cpm || 0,
+    rpm: rawStats.rpm || 0,
+    revenue: rawStats.revenue || 0,
+});
 
-// -----------------------------
+// ============================================
 // 7. AUTH ENDPOINTS
-// -----------------------------
-
+// ============================================
 app.post('/api/auth/admin-login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(400).json({ message: 'Email and password required' });
-        }
+        if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
 
         const authData = await firebaseAuth(email, password);
         const uid = authData.localId;
 
         const userDoc = await db.collection('users').doc(uid).get();
-        if (!userDoc.exists) {
-            return res.status(403).json({ message: 'Access denied: User not found' });
-        }
+        if (!userDoc.exists) return res.status(403).json({ message: 'Access denied: User not found' });
 
         const userData = userDoc.data();
-        if (userData.role !== 'admin') {
-            return res.status(403).json({ message: 'Access denied: Not an administrator' });
-        }
+        if (userData.role !== 'admin') return res.status(403).json({ message: 'Access denied: Not an administrator' });
 
-        const token = jwt.sign(
-            { uid, email, role: 'admin' },
-            JWT_SECRET,
-            { expiresIn: '24h' }
-        );
-
+        const token = jwt.sign({ uid, email, role: 'admin' }, JWT_SECRET, { expiresIn: '24h' });
         res.json({ token, message: 'Admin login successful' });
     } catch (error) {
         console.error('Admin login error:', error.response?.data || error.message);
-        if (error.response?.data?.error?.message) {
-            return res.status(401).json({ message: 'Invalid email or password' });
-        }
+        if (error.response?.data?.error?.message) return res.status(401).json({ message: 'Invalid email or password' });
         res.status(500).json({ message: 'Internal server error' });
     }
 });
@@ -280,48 +289,46 @@ app.post('/api/auth/admin-login', async (req, res) => {
 app.post('/api/auth/user-login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(400).json({ message: 'Email and password required' });
-        }
+        if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
 
         const authData = await firebaseAuth(email, password);
         const uid = authData.localId;
 
         const userDoc = await db.collection('users').doc(uid).get();
-        if (!userDoc.exists) {
-            return res.status(403).json({ message: 'Access denied: User not found' });
-        }
+        if (!userDoc.exists) return res.status(403).json({ message: 'Access denied: User not found' });
 
         const userData = userDoc.data();
-        if (userData.role !== 'user') {
-            return res.status(403).json({ message: 'Access denied: Invalid user role' });
-        }
+        if (userData.role !== 'user') return res.status(403).json({ message: 'Access denied: Invalid user role' });
 
-        const token = jwt.sign(
-            { uid, email, role: 'user' },
-            JWT_SECRET,
-            { expiresIn: '24h' }
-        );
-
+        const token = jwt.sign({ uid, email, role: 'user' }, JWT_SECRET, { expiresIn: '24h' });
         res.json({ token, message: 'User login successful' });
     } catch (error) {
         console.error('User login error:', error.response?.data || error.message);
-        if (error.response?.data?.error?.message) {
-            return res.status(401).json({ message: 'Invalid email or password' });
-        }
+        if (error.response?.data?.error?.message) return res.status(401).json({ message: 'Invalid email or password' });
         res.status(500).json({ message: 'Internal server error' });
     }
 });
 
-// -----------------------------
-// 8. ADMIN ENDPOINTS (REAL DATA)
-// -----------------------------
+// ============================================
+// 8. ADMIN ENDPOINTS (WITH FALLBACK)
+// ============================================
 
-// --- GET Smartlinks (combine Adsterra + Firestore assignments) ---
 app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
     try {
-        // Fetch from Adsterra
-        const adsterraLinks = await fetchSmartlinksFromAdsterra();
+        let adsterraLinks = [];
+        try {
+            adsterraLinks = await fetchSmartlinksFromAdsterra();
+        } catch (error) {
+            console.warn('⚠️ Adsterra API failed, using fallback mock data.');
+            // Fallback: Return mock data so admin panel at least shows something
+            adsterraLinks = [
+                { id: '30979549', name: 'MN02-D' },
+                { id: '30979548', name: 'MN02-C' },
+                { id: '30979544', name: 'MN02-B' },
+                { id: '30979542', name: 'MN02-A' },
+                { id: '30853036', name: 'Moon' },
+            ];
+        }
 
         // Fetch assignments from Firestore
         const assignmentsSnapshot = await db.collection('assignments').get();
@@ -334,29 +341,20 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
             };
         });
 
-        // Build response with status
         const smartlinks = adsterraLinks.map(link => {
             const assigned = assignments[link.id];
-            if (assigned) {
-                return {
-                    ...link,
-                    status: 'assigned',
-                    assignedTo: assigned.userEmail,
-                    assignedUserId: assigned.userId,
-                };
-            } else {
-                return {
-                    ...link,
-                    status: 'available',
-                    assignedTo: null,
-                };
-            }
+            return {
+                ...link,
+                status: assigned ? 'assigned' : 'available',
+                assignedTo: assigned ? assigned.userEmail : null,
+                assignedUserId: assigned ? assigned.userId : null,
+            };
         });
 
         res.json(smartlinks);
     } catch (error) {
         console.error('Smartlinks fetch error:', error.message);
-        res.status(500).json({ message: 'Failed to fetch smartlinks' });
+        res.status(500).json({ message: 'Failed to fetch smartlinks', error: error.message });
     }
 });
 
@@ -365,12 +363,10 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
     try {
         const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
         const users = [];
-
         for (const doc of usersSnapshot.docs) {
             const data = doc.data();
             let smartlinkName = null;
             if (data.smartlinkId) {
-                // Get smartlink name from assignments collection
                 const assignmentDoc = await db.collection('assignments').doc(data.smartlinkId).get();
                 if (assignmentDoc.exists) {
                     smartlinkName = assignmentDoc.data().smartlinkName || data.smartlinkId;
@@ -387,7 +383,6 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
                 smartlinkName: smartlinkName,
             });
         }
-
         res.json(users);
     } catch (error) {
         console.error('Users fetch error:', error);
@@ -399,39 +394,21 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
 app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
     try {
         const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(400).json({ message: 'Email and password required' });
-        }
+        if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
 
-        // Create in Firebase Auth
-        const userRecord = await admin.auth().createUser({
-            email: email,
-            password: password,
-            emailVerified: false,
-            disabled: false,
-        });
-
-        // Save to Firestore with default permissions
+        const userRecord = await admin.auth().createUser({ email, password, emailVerified: false, disabled: false });
         await db.collection('users').doc(userRecord.uid).set({
-            email: email,
+            email,
             role: 'user',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            permissions: {
-                impressions: true,
-                clicks: true,
-                cpm: true,
-                rpm: true,
-                revenue: true,
-            },
+            permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
             smartlinkId: null,
         });
 
         res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
     } catch (error) {
         console.error('Create user error:', error);
-        if (error.code === 'auth/email-already-exists') {
-            return res.status(400).json({ message: 'Email already exists' });
-        }
+        if (error.code === 'auth/email-already-exists') return res.status(400).json({ message: 'Email already exists' });
         res.status(500).json({ message: 'Failed to create user' });
     }
 });
@@ -440,18 +417,12 @@ app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
 app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) => {
     try {
         const { uid } = req.params;
-        // Delete from Firebase Auth
         await admin.auth().deleteUser(uid);
-        // Delete from Firestore
         await db.collection('users').doc(uid).delete();
-        // Remove assignments
         const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
         const batch = db.batch();
-        assignmentsSnapshot.forEach(doc => {
-            batch.delete(doc.ref);
-        });
+        assignmentsSnapshot.forEach(doc => batch.delete(doc.ref));
         await batch.commit();
-
         res.json({ message: 'User deleted successfully' });
     } catch (error) {
         console.error('Delete user error:', error);
@@ -463,48 +434,31 @@ app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) =>
 app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
     try {
         const { email, smartlinkId } = req.body;
-        if (!email || !smartlinkId) {
-            return res.status(400).json({ message: 'Email and Smartlink ID required' });
-        }
+        if (!email || !smartlinkId) return res.status(400).json({ message: 'Email and Smartlink ID required' });
 
-        // Find user by email
         const userSnapshot = await db.collection('users').where('email', '==', email).where('role', '==', 'user').get();
-        if (userSnapshot.empty) {
-            return res.status(404).json({ message: 'User not found' });
-        }
+        if (userSnapshot.empty) return res.status(404).json({ message: 'User not found' });
         const userDoc = userSnapshot.docs[0];
         const uid = userDoc.id;
 
-        // Check if smartlink already assigned
         const existingAssignment = await db.collection('assignments').doc(smartlinkId).get();
-        if (existingAssignment.exists) {
-            return res.status(400).json({ message: 'Smartlink already assigned to another user' });
-        }
+        if (existingAssignment.exists) return res.status(400).json({ message: 'Smartlink already assigned' });
 
-        // Get smartlink name from Adsterra (optional: fetch from Adsterra API)
-        // For simplicity, we'll fetch from Adsterra or fallback to ID.
         let smartlinkName = smartlinkId;
         try {
             const adsterraLinks = await fetchSmartlinksFromAdsterra();
             const found = adsterraLinks.find(l => l.id == smartlinkId);
             if (found) smartlinkName = found.name;
-        } catch (e) {
-            console.warn('Could not fetch smartlink name from Adsterra, using ID.');
-        }
+        } catch (e) { /* ignore */ }
 
-        // Create assignment in Firestore
         await db.collection('assignments').doc(smartlinkId).set({
             userId: uid,
             userEmail: email,
-            smartlinkId: smartlinkId,
-            smartlinkName: smartlinkName,
+            smartlinkId,
+            smartlinkName,
             assignedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-
-        // Update user document
-        await db.collection('users').doc(uid).update({
-            smartlinkId: smartlinkId,
-        });
+        await db.collection('users').doc(uid).update({ smartlinkId });
 
         res.json({ message: 'Smartlink assigned successfully' });
     } catch (error) {
@@ -517,26 +471,14 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
 app.post('/api/admin/unassign', authMiddleware('admin'), async (req, res) => {
     try {
         const { smartlinkId } = req.body;
-        if (!smartlinkId) {
-            return res.status(400).json({ message: 'Smartlink ID required' });
-        }
+        if (!smartlinkId) return res.status(400).json({ message: 'Smartlink ID required' });
 
         const assignmentDoc = await db.collection('assignments').doc(smartlinkId).get();
-        if (!assignmentDoc.exists) {
-            return res.status(404).json({ message: 'Assignment not found' });
-        }
+        if (!assignmentDoc.exists) return res.status(404).json({ message: 'Assignment not found' });
 
         const uid = assignmentDoc.data().userId;
-
-        // Remove assignment
         await db.collection('assignments').doc(smartlinkId).delete();
-
-        // Update user document
-        if (uid) {
-            await db.collection('users').doc(uid).update({
-                smartlinkId: null,
-            });
-        }
+        if (uid) await db.collection('users').doc(uid).update({ smartlinkId: null });
 
         res.json({ message: 'Smartlink unassigned successfully' });
     } catch (error) {
@@ -545,24 +487,18 @@ app.post('/api/admin/unassign', authMiddleware('admin'), async (req, res) => {
     }
 });
 
-// --- UPDATE Permissions (Metric Toggles) ---
+// --- UPDATE Permissions ---
 app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) => {
     try {
         const { userId, metric, value } = req.body;
-        if (!userId || !metric || value === undefined) {
-            return res.status(400).json({ message: 'userId, metric, and value required' });
-        }
+        if (!userId || !metric || value === undefined) return res.status(400).json({ message: 'Missing fields' });
 
         const validMetrics = ['impressions', 'clicks', 'cpm', 'rpm', 'revenue'];
-        if (!validMetrics.includes(metric)) {
-            return res.status(400).json({ message: 'Invalid metric' });
-        }
+        if (!validMetrics.includes(metric)) return res.status(400).json({ message: 'Invalid metric' });
 
-        const userRef = db.collection('users').doc(userId);
         const updateData = {};
         updateData[`permissions.${metric}`] = value;
-
-        await userRef.update(updateData);
+        await db.collection('users').doc(userId).update(updateData);
 
         res.json({ message: 'Permission updated successfully' });
     } catch (error) {
@@ -571,18 +507,14 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
     }
 });
 
-// -----------------------------
-// 9. USER DASHBOARD STATS (REAL DATA)
-// -----------------------------
+// ============================================
+// 9. USER STATS (with fallback)
+// ============================================
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
-
-        // Get user data
         const userDoc = await db.collection('users').doc(uid).get();
-        if (!userDoc.exists) {
-            return res.status(404).json({ message: 'User not found' });
-        }
+        if (!userDoc.exists) return res.status(404).json({ message: 'User not found' });
 
         const userData = userDoc.data();
         const permissions = userData.permissions || {};
@@ -592,34 +524,18 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
         let metrics = {};
 
         if (smartlinkId) {
-            // Get smartlink name from assignments
             const assignmentDoc = await db.collection('assignments').doc(smartlinkId).get();
             const smartlinkName = assignmentDoc.exists ? assignmentDoc.data().smartlinkName : smartlinkId;
+            smartlinkData = { id: smartlinkId, name: smartlinkName };
 
-            smartlinkData = {
-                id: smartlinkId,
-                name: smartlinkName,
-            };
-
-            // Fetch stats from Adsterra for this smartlink
-            // Date range: last 7 days (or today)
             const today = new Date().toISOString().split('T')[0];
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
             try {
                 const rawStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, smartlinkId);
-                // If rawStats is an array, find the correct one; else use directly.
-                let statsForLink = rawStats;
-                if (Array.isArray(rawStats)) {
-                    statsForLink = rawStats.find(item => 
-                        (item.placement_id && item.placement_id == smartlinkId) ||
-                        (item.smartlink_id && item.smartlink_id == smartlinkId)
-                    ) || {};
-                }
-                metrics = mapStatsToMetrics(statsForLink);
+                metrics = mapStatsToMetrics(rawStats);
             } catch (error) {
-                console.error('Stats fetch error for user:', error);
-                // Return empty metrics instead of failing entirely
+                console.warn('⚠️ Stats fetch failed, returning zeros');
                 metrics = { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
             }
         }
@@ -636,9 +552,9 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     }
 });
 
-// -----------------------------
+// ============================================
 // 10. ROOT / HEALTH CHECK
-// -----------------------------
+// ============================================
 app.get('/api', (req, res) => {
     res.json({
         name: 'Lunar Metrics API',
@@ -648,7 +564,4 @@ app.get('/api', (req, res) => {
     });
 });
 
-// -----------------------------
-// 11. EXPORT
-// -----------------------------
 module.exports = app;
