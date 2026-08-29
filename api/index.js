@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Enhanced Name Extraction from Adsterra
+// Fixed Adsterra Authentication (X-API-Key)
 // ============================================
 
 const express = require('express');
@@ -25,7 +25,7 @@ const {
 console.log('✅ Environment loaded:');
 console.log(`  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID || '❌ MISSING'}`);
 console.log(`  ADSTERRA_API_KEY: ${ADSTERRA_API_KEY ? '✅ Set' : '❌ MISSING'}`);
-console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || 'https://api3.adsterratools.com'}`);
+console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/'}`);
 console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
@@ -93,15 +93,18 @@ app.get('/api/test', (req, res) => {
     });
 });
 
-// ----- ADSTERRA TEST ENDPOINT (Debugging) -----
+// ----- ADSTERRA TEST ENDPOINT (Fixed) -----
 app.get('/api/test-adsterra', async (req, res) => {
     try {
-        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
-        const url = `${baseUrl}/publisher/smart-links.json?api_key=${ADSTERRA_API_KEY}`;
+        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
+        const url = `${baseUrl}smart-links.json`;
         
-        console.log('🔄 Testing Adsterra API (query param):', url);
+        console.log('🔄 Testing Adsterra API with X-API-Key header:', url);
         const response = await axios.get(url, {
-            headers: { 'Accept': 'application/json' },
+            headers: {
+                'X-API-Key': ADSTERRA_API_KEY,
+                'Accept': 'application/json'
+            },
             timeout: 15000,
         });
         
@@ -173,139 +176,87 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS (ENHANCED NAME EXTRACTION)
+// 6. ADSTERRA API HELPERS (FIXED)
 // -----------------------------
 
 /**
  * Fetch ALL Smartlinks from Adsterra with REAL names
- * Tries multiple authentication methods
+ * ✅ Correct URL: https://api3.adsterratools.com/publisher/smart-links.json
+ * ✅ Correct Auth: X-API-Key header
  */
 const fetchSmartlinksFromAdsterra = async () => {
-    const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
-    const endpoint = '/publisher/smart-links.json';
+    const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
+    const endpoint = 'smart-links.json';
     const url = `${baseUrl}${endpoint}`;
 
-    const methods = [
-        {
-            name: 'Query param: api_key',
-            config: {
-                params: { api_key: ADSTERRA_API_KEY },
-                headers: { 'Accept': 'application/json' },
-                timeout: 15000,
-            }
-        },
-        {
-            name: 'Query param: key',
-            config: {
-                params: { key: ADSTERRA_API_KEY },
-                headers: { 'Accept': 'application/json' },
-                timeout: 15000,
-            }
-        },
-        {
-            name: 'Bearer token',
-            config: {
-                headers: { 
-                    'Authorization': `Bearer ${ADSTERRA_API_KEY}`,
-                    'Accept': 'application/json'
-                },
-                timeout: 15000,
-            }
-        },
-        {
-            name: 'X-API-Key header',
-            config: {
-                headers: { 
-                    'X-API-Key': ADSTERRA_API_KEY,
-                    'Accept': 'application/json'
-                },
-                timeout: 15000,
-            }
-        },
-        {
-            name: 'Api-Key header',
-            config: {
-                headers: { 
-                    'Api-Key': ADSTERRA_API_KEY,
-                    'Accept': 'application/json'
-                },
-                timeout: 15000,
-            }
+    console.log(`🔄 Fetching real smartlinks from: ${url} using X-API-Key`);
+
+    try {
+        const response = await axios.get(url, {
+            headers: {
+                'X-API-Key': ADSTERRA_API_KEY,
+                'Accept': 'application/json',
+            },
+            timeout: 15000,
+        });
+
+        if (response.status !== 200) {
+            throw new Error(`Adsterra returned status ${response.status}`);
         }
-    ];
 
-    let lastError = null;
-
-    for (const method of methods) {
-        try {
-            console.log(`🔄 Trying auth method: ${method.name}`);
-            const response = await axios.get(url, method.config);
-
-            if (response.status === 200) {
-                console.log(`✅ Success with method: ${method.name}`);
-
-                let items = [];
-                if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
-                    items = response.data.data.items;
-                } else if (response.data && Array.isArray(response.data)) {
-                    items = response.data;
-                } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
-                    items = response.data.items;
-                } else if (response.data && response.data.result && Array.isArray(response.data.result)) {
-                    items = response.data.result;
-                } else {
-                    console.warn('⚠️ Unexpected response structure:', typeof response.data);
-                    items = [];
-                }
-
-                if (items.length === 0) {
-                    console.warn('⚠️ Adsterra returned 0 smartlinks');
-                }
-
-                // ✅ ENHANCED NAME EXTRACTION
-                const mapped = items.map(item => {
-                    // Try multiple fields for name
-                    let name = item.name || item.title || item.label || item.smartlink_name || '';
-                    
-                    // If still empty, try to find any string field with "name" in it
-                    if (!name) {
-                        for (const key of Object.keys(item)) {
-                            if (key.toLowerCase().includes('name') && typeof item[key] === 'string') {
-                                name = item[key];
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // If still empty, use ID as fallback
-                    if (!name) {
-                        name = item.id || item.smart_link_id || item.placement_id || 'Unnamed';
-                    }
-
-                    return {
-                        id: item.id || item.smart_link_id || item.placement_id || String(item),
-                        name: name,
-                    };
-                });
-
-                console.log(`✅ Fetched ${mapped.length} smartlinks with names`);
-                // Log first 3 names for verification
-                mapped.slice(0, 3).forEach((link, i) => {
-                    console.log(`  ${i+1}. ${link.id} → ${link.name}`);
-                });
-
-                return mapped;
-            }
-        } catch (error) {
-            lastError = error;
-            const errorMsg = error.response?.data?.message || error.message;
-            console.warn(`❌ Method ${method.name} failed: ${errorMsg}`);
+        let items = [];
+        if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
+            items = response.data.data.items;
+        } else if (response.data && Array.isArray(response.data)) {
+            items = response.data;
+        } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
+            items = response.data.items;
+        } else if (response.data && response.data.result && Array.isArray(response.data.result)) {
+            items = response.data.result;
+        } else {
+            throw new Error('Unexpected response structure from Adsterra');
         }
+
+        if (items.length === 0) {
+            console.warn('⚠️ Adsterra returned 0 smartlinks');
+        }
+
+        // Enhanced name extraction
+        const mapped = items.map(item => {
+            // Try multiple fields for name
+            let name = item.name || item.title || item.label || item.smartlink_name || '';
+            
+            // If still empty, try to find any string field with "name" in it
+            if (!name) {
+                for (const key of Object.keys(item)) {
+                    if (key.toLowerCase().includes('name') && typeof item[key] === 'string') {
+                        name = item[key];
+                        break;
+                    }
+                }
+            }
+            
+            // If still empty, use ID as fallback
+            if (!name) {
+                name = item.id || item.smart_link_id || item.placement_id || 'Unnamed';
+            }
+
+            return {
+                id: item.id || item.smart_link_id || item.placement_id || String(item),
+                name: name,
+            };
+        });
+
+        console.log(`✅ Fetched ${mapped.length} smartlinks with names`);
+        mapped.slice(0, 3).forEach((link, i) => {
+            console.log(`  ${i+1}. ${link.id} → ${link.name}`);
+        });
+
+        return mapped;
+    } catch (error) {
+        console.error('❌ Adsterra API error:', error.response?.data || error.message);
+        throw new Error(`Failed to fetch real data from Adsterra: ${error.response?.data?.message || error.message}`);
     }
-
-    console.error('❌ All authentication methods failed.');
-    const detailedError = lastError?.response?.data || lastError?.message || 'Unknown error';
-    throw new Error(`Failed to fetch real data from Adsterra: ${detailedError}`);
 };
 
 /**
@@ -313,12 +264,11 @@ const fetchSmartlinksFromAdsterra = async () => {
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
-        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
-        const endpoint = '/publisher/stats.json';
+        const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
+        const endpoint = 'stats.json';
         const url = `${baseUrl}${endpoint}`;
 
         const params = {
-            api_key: ADSTERRA_API_KEY,
             from: dateFrom,
             to: dateTo,
         };
@@ -328,7 +278,10 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
 
         const response = await axios.get(url, {
             params: params,
-            headers: { 'Accept': 'application/json' },
+            headers: {
+                'X-API-Key': ADSTERRA_API_KEY,
+                'Accept': 'application/json'
+            },
             timeout: 15000,
         });
 
