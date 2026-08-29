@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Multiple Smartlinks per User Support
+// Real Smartlink Names from Adsterra
 // ============================================
 
 const express = require('express');
@@ -128,15 +128,13 @@ const firebaseAuth = async (email, password) => {
 // -----------------------------
 
 /**
- * Fetch ALL Smartlinks from Adsterra
- * Uses api_key query parameter for authentication
+ * Fetch ALL Smartlinks from Adsterra with real names
  */
 const fetchSmartlinksFromAdsterra = async () => {
     const baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com';
     const endpoint = '/publisher/smart-links.json';
     const url = `${baseUrl}${endpoint}`;
 
-    // Multiple authentication methods to try
     const authMethods = [
         {
             name: 'query-api_key',
@@ -339,6 +337,7 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
             assignments[data.smartlinkId] = {
                 userEmail: data.userEmail,
                 userId: data.userId,
+                smartlinkName: data.smartlinkName, // Use stored name
             };
         });
 
@@ -346,6 +345,8 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
             const assigned = assignments[link.id];
             return {
                 ...link,
+                // ✅ Use Adsterra's real name (override stored if available)
+                name: link.name || assigned?.smartlinkName || link.id,
                 status: assigned ? 'assigned' : 'available',
                 assignedTo: assigned ? assigned.userEmail : null,
                 assignedUserId: assigned ? assigned.userId : null,
@@ -366,7 +367,6 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
         const users = [];
         for (const doc of usersSnapshot.docs) {
             const data = doc.data();
-            // Fetch all assigned smartlink names for this user
             const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', doc.id).get();
             const smartlinkNames = [];
             assignmentsSnapshot.forEach(assignmentDoc => {
@@ -442,7 +442,7 @@ app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) =>
     }
 });
 
-// --- ASSIGN Smartlink ---
+// --- ASSIGN Smartlink (UPDATED: Fetches real name from Adsterra) ---
 app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
     try {
         const { email, smartlinkId } = req.body;
@@ -456,28 +456,35 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
         const existingAssignment = await db.collection('assignments').doc(smartlinkId).get();
         if (existingAssignment.exists) return res.status(400).json({ message: 'Smartlink already assigned' });
 
+        // ✅ Fetch real name from Adsterra
         let smartlinkName = smartlinkId;
         try {
             const adsterraLinks = await fetchSmartlinksFromAdsterra();
             const found = adsterraLinks.find(l => l.id == smartlinkId);
-            if (found) smartlinkName = found.name;
-        } catch (e) { /* ignore */ }
+            if (found && found.name) {
+                smartlinkName = found.name;
+                console.log(`✅ Found real name for ${smartlinkId}: ${smartlinkName}`);
+            } else {
+                console.warn(`⚠️ No name found for ${smartlinkId}, using ID as fallback`);
+            }
+        } catch (error) {
+            console.warn(`⚠️ Could not fetch name from Adsterra, using ID as fallback: ${error.message}`);
+            smartlinkName = smartlinkId;
+        }
 
         await db.collection('assignments').doc(smartlinkId).set({
             userId: uid,
             userEmail: email,
             smartlinkId,
-            smartlinkName,
+            smartlinkName, // ✅ Real name saved
             assignedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        // Update user document - keep smartlinkId for backward compatibility,
-        // but the source of truth is now the assignments collection.
         await db.collection('users').doc(uid).update({
             smartlinkId: smartlinkId,
         });
 
-        res.json({ message: 'Smartlink assigned successfully' });
+        res.json({ message: `Smartlink "${smartlinkName}" assigned successfully` });
     } catch (error) {
         console.error('Assign error:', error);
         res.status(500).json({ message: 'Failed to assign smartlink' });
@@ -497,7 +504,6 @@ app.post('/api/admin/unassign', authMiddleware('admin'), async (req, res) => {
 
         await db.collection('assignments').doc(smartlinkId).delete();
 
-        // Check if user has any other assignments
         const remainingAssignments = await db.collection('assignments').where('userId', '==', uid).get();
         if (remainingAssignments.empty) {
             await db.collection('users').doc(uid).update({ smartlinkId: null });
@@ -531,13 +537,75 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
 });
 
 // ============================================
-// 9. USER STATS (UPDATED - MULTIPLE LINKS)
+// 9. FIX EXISTING ASSIGNMENT NAMES
+// ============================================
+app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
+    try {
+        console.log('🔄 Starting name fix for all assignments...');
+
+        // 1. Fetch all smartlinks from Adsterra with real names
+        let adsterraLinks = [];
+        try {
+            adsterraLinks = await fetchSmartlinksFromAdsterra();
+        } catch (error) {
+            return res.status(500).json({ 
+                message: 'Failed to fetch smartlinks from Adsterra', 
+                error: error.message 
+            });
+        }
+
+        // Create a map: ID -> Name
+        const nameMap = {};
+        adsterraLinks.forEach(link => {
+            nameMap[link.id] = link.name;
+        });
+
+        console.log(`✅ Fetched ${Object.keys(nameMap).length} smartlinks from Adsterra`);
+
+        // 2. Get all assignments from Firestore
+        const assignmentsSnapshot = await db.collection('assignments').get();
+        let updatedCount = 0;
+        let notFoundCount = 0;
+
+        const batch = db.batch();
+
+        assignmentsSnapshot.forEach(doc => {
+            const data = doc.data();
+            const smartlinkId = data.smartlinkId;
+            const realName = nameMap[smartlinkId];
+
+            if (realName && realName !== data.smartlinkName) {
+                // Update with real name
+                batch.update(doc.ref, { smartlinkName: realName });
+                updatedCount++;
+                console.log(`✅ Updated ${smartlinkId}: ${data.smartlinkName} → ${realName}`);
+            } else if (!realName) {
+                notFoundCount++;
+                console.warn(`⚠️ No real name found for ${smartlinkId}`);
+            }
+        });
+
+        await batch.commit();
+
+        res.json({
+            message: 'Assignment names fixed successfully!',
+            updated: updatedCount,
+            notFound: notFoundCount,
+            total: assignmentsSnapshot.size,
+        });
+    } catch (error) {
+        console.error('Fix names error:', error);
+        res.status(500).json({ message: 'Failed to fix names', error: error.message });
+    }
+});
+
+// ============================================
+// 10. USER STATS (UPDATED)
 // ============================================
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
 
-        // 1. Get user data from Firestore
         const userDoc = await db.collection('users').doc(uid).get();
         if (!userDoc.exists) {
             return res.status(404).json({ message: 'User not found' });
@@ -546,7 +614,6 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
         const userData = userDoc.data();
         const permissions = userData.permissions || {};
 
-        // 2. Get ALL assigned smartlinks for this user from assignments collection
         const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
 
         const smartlinks = [];
@@ -558,6 +625,7 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
             for (const doc of assignmentsSnapshot.docs) {
                 const assignmentData = doc.data();
                 const smartlinkId = assignmentData.smartlinkId;
+                // ✅ Use stored smartlinkName (which is now real name)
                 const smartlinkName = assignmentData.smartlinkName || smartlinkId;
 
                 try {
@@ -580,11 +648,10 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
             }
         }
 
-        // 3. Return response with ALL links
         res.json({
             userEmail: userData.email,
             permissions: permissions,
-            smartlinks: smartlinks,  // ✅ Array of ALL assigned links
+            smartlinks: smartlinks,
         });
     } catch (error) {
         console.error('User stats error:', error);
@@ -593,7 +660,7 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
 });
 
 // ============================================
-// 10. ROOT / HEALTH CHECK
+// 11. ROOT / HEALTH CHECK
 // ============================================
 app.get('/api', (req, res) => {
     res.json({
