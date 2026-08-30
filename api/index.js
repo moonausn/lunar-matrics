@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Real Smartlink Names (alias) + URL + Signup + Analytics + Charts + Compare
+// Real Smartlink Names (alias) + URL + Signup + Analytics
 // ============================================
 
 const express = require('express');
@@ -259,7 +259,6 @@ const fetchSmartlinksFromAdsterra = async () => {
 
 /**
  * Fetch statistics for a specific smartlink for a given date range
- * Returns aggregated stats for that period.
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
@@ -315,17 +314,6 @@ const mapStatsToMetrics = (rawStats) => ({
     revenue: rawStats.revenue || 0,
 });
 
-// Helper to generate date range array
-const getDateRange = (days) => {
-    const dates = [];
-    for (let i = days - 1; i >= 0; i--) {
-        const d = new Date();
-        d.setDate(d.getDate() - i);
-        dates.push(d.toISOString().split('T')[0]);
-    }
-    return dates;
-};
-
 // ============================================
 // 7. AUTH ENDPOINTS (including signup)
 // ============================================
@@ -376,7 +364,7 @@ app.post('/api/auth/user-login', async (req, res) => {
     }
 });
 
-// ----- USER SIGNUP -----
+// ----- USER SIGNUP (NEW) -----
 app.post('/api/auth/user-signup', async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -387,14 +375,16 @@ app.post('/api/auth/user-signup', async (req, res) => {
             return res.status(400).json({ message: 'Password must be at least 6 characters' });
         }
 
+        // 1. Create user in Firebase Auth
         const userRecord = await admin.auth().createUser({
             email: email,
             password: password,
             emailVerified: false,
             disabled: false,
-            displayName: name,
+            displayName: name, // set displayName in Auth
         });
 
+        // 2. Save to Firestore with default permissions
         await db.collection('users').doc(userRecord.uid).set({
             email: email,
             displayName: name,
@@ -717,19 +707,20 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
 });
 
 // ============================================
-// 11. USER ANALYTICS
+// 11. USER ANALYTICS (NEW)
 // ============================================
 app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
     try {
         const currentUid = req.user.uid;
 
+        // 1. Fetch all users with role 'user' except the current user
         const usersSnapshot = await db.collection('users')
             .where('role', '==', 'user')
             .get();
 
         const otherUsers = [];
         for (const doc of usersSnapshot.docs) {
-            if (doc.id === currentUid) continue;
+            if (doc.id === currentUid) continue; // exclude self
             const data = doc.data();
             otherUsers.push({
                 uid: doc.id,
@@ -738,12 +729,14 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             });
         }
 
+        // 2. For each user, get total daily clicks from all their assigned smartlinks
         const today = new Date().toISOString().split('T')[0];
-        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0]; // next day
 
         const analytics = [];
 
         for (const user of otherUsers) {
+            // Fetch assignments for this user
             const assignmentsSnapshot = await db.collection('assignments')
                 .where('userId', '==', user.uid)
                 .get();
@@ -755,11 +748,13 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
                     const assignmentData = doc.data();
                     const smartlinkId = assignmentData.smartlinkId;
                     try {
+                        // Get today's stats for this smartlink
                         const rawStats = await fetchStatsFromAdsterra(today, tomorrow, smartlinkId);
                         const clicks = rawStats.clicks || 0;
                         totalClicks += clicks;
                     } catch (error) {
                         console.warn(`⚠️ Failed to fetch stats for link ${smartlinkId} for user ${user.email}:`, error.message);
+                        // Skip this link, continue with others
                     }
                 }
             }
@@ -771,6 +766,7 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             });
         }
 
+        // Sort by total clicks descending (optional)
         analytics.sort((a, b) => b.totalClicks - a.totalClicks);
 
         res.json({
@@ -784,208 +780,7 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
 });
 
 // ============================================
-// 12. CHARTS & COMPARE ENDPOINTS (NEW - REAL DATA)
-// ============================================
-
-/**
- * ADMIN CHART: Get daily aggregated clicks/impressions for ALL links.
- * Real data fetched from Adsterra for each day in the range.
- */
-app.get('/api/admin/chart', authMiddleware('admin'), async (req, res) => {
-    try {
-        const days = parseInt(req.query.days) || 7;
-        const maxDays = 30;
-        const actualDays = Math.min(days, maxDays);
-
-        // 1. Fetch all smartlinks from Adsterra
-        const allLinks = await fetchSmartlinksFromAdsterra();
-        if (allLinks.length === 0) {
-            return res.json({ labels: [], clicks: [], impressions: [] });
-        }
-
-        // 2. Generate date range
-        const dateLabels = [];
-        const clicksData = [];
-        const impressionsData = [];
-        const dateStrings = getDateRange(actualDays);
-
-        // 3. For each date, fetch stats for all links and aggregate
-        for (const dateStr of dateStrings) {
-            const nextDate = new Date(dateStr);
-            nextDate.setDate(nextDate.getDate() + 1);
-            const nextDateStr = nextDate.toISOString().split('T')[0];
-
-            let dailyClicks = 0;
-            let dailyImpressions = 0;
-
-            // Fetch stats for each link on this specific date
-            const linkPromises = allLinks.map(link => 
-                fetchStatsFromAdsterra(dateStr, nextDateStr, link.id)
-            );
-            
-            const results = await Promise.all(linkPromises);
-            
-            results.forEach(stats => {
-                dailyClicks += (stats.clicks || 0);
-                dailyImpressions += (stats.impressions || 0);
-            });
-
-            dateLabels.push(dateStr);
-            clicksData.push(dailyClicks);
-            impressionsData.push(dailyImpressions);
-        }
-
-        res.json({
-            labels: dateLabels,
-            clicks: clicksData,
-            impressions: impressionsData,
-        });
-    } catch (error) {
-        console.error('Admin chart error:', error);
-        res.status(500).json({ 
-            message: 'Failed to fetch chart data', 
-            error: error.message 
-        });
-    }
-});
-
-/**
- * USER CHART: Get daily aggregated clicks/impressions for user's assigned links.
- * Real data fetched from Adsterra for each day in the range.
- */
-app.get('/api/user/chart', authMiddleware('user'), async (req, res) => {
-    try {
-        const days = parseInt(req.query.days) || 7;
-        const maxDays = 30;
-        const actualDays = Math.min(days, maxDays);
-        const uid = req.user.uid;
-
-        // 1. Get user's assigned links from Firestore
-        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
-        
-        if (assignmentsSnapshot.empty) {
-            return res.json({ labels: [], clicks: [], impressions: [] });
-        }
-
-        const userLinks = [];
-        assignmentsSnapshot.forEach(doc => {
-            const data = doc.data();
-            userLinks.push({
-                id: data.smartlinkId,
-                name: data.smartlinkName || data.smartlinkId,
-            });
-        });
-
-        // 2. Generate date range
-        const dateLabels = [];
-        const clicksData = [];
-        const impressionsData = [];
-        const dateStrings = getDateRange(actualDays);
-
-        // 3. For each date, fetch stats for user's links and aggregate
-        for (const dateStr of dateStrings) {
-            const nextDate = new Date(dateStr);
-            nextDate.setDate(nextDate.getDate() + 1);
-            const nextDateStr = nextDate.toISOString().split('T')[0];
-
-            let dailyClicks = 0;
-            let dailyImpressions = 0;
-
-            const linkPromises = userLinks.map(link => 
-                fetchStatsFromAdsterra(dateStr, nextDateStr, link.id)
-            );
-            
-            const results = await Promise.all(linkPromises);
-            
-            results.forEach(stats => {
-                dailyClicks += (stats.clicks || 0);
-                dailyImpressions += (stats.impressions || 0);
-            });
-
-            dateLabels.push(dateStr);
-            clicksData.push(dailyClicks);
-            impressionsData.push(dailyImpressions);
-        }
-
-        res.json({
-            labels: dateLabels,
-            clicks: clicksData,
-            impressions: impressionsData,
-        });
-    } catch (error) {
-        console.error('User chart error:', error);
-        res.status(500).json({ 
-            message: 'Failed to fetch chart data', 
-            error: error.message 
-        });
-    }
-});
-
-/**
- * ADMIN LINK STATS: Get stats for a specific link (for comparison).
- * Real data fetched from Adsterra.
- */
-app.get('/api/admin/link-stats', authMiddleware('admin'), async (req, res) => {
-    try {
-        const { id, from, to } = req.query;
-        if (!id || !from || !to) {
-            return res.status(400).json({ message: 'Missing id, from, or to parameters' });
-        }
-
-        const stats = await fetchStatsFromAdsterra(from, to, id);
-        res.json({
-            clicks: stats.clicks || 0,
-            impressions: stats.impressions || 0,
-            cpm: stats.cpm || 0,
-            rpm: stats.rpm || 0,
-            revenue: stats.revenue || 0,
-        });
-    } catch (error) {
-        console.error('Admin link stats error:', error);
-        res.status(500).json({ 
-            message: 'Failed to fetch link stats', 
-            error: error.message 
-        });
-    }
-});
-
-/**
- * USER LINK STATS: Get stats for a specific user link (for comparison).
- * Real data fetched from Adsterra.
- */
-app.get('/api/user/link-stats', authMiddleware('user'), async (req, res) => {
-    try {
-        const { id, from, to } = req.query;
-        if (!id || !from || !to) {
-            return res.status(400).json({ message: 'Missing id, from, or to parameters' });
-        }
-
-        // Verify the user actually has this link assigned
-        const uid = req.user.uid;
-        const assignmentDoc = await db.collection('assignments').doc(id).get();
-        if (!assignmentDoc.exists || assignmentDoc.data().userId !== uid) {
-            return res.status(403).json({ message: 'You do not have access to this link' });
-        }
-
-        const stats = await fetchStatsFromAdsterra(from, to, id);
-        res.json({
-            clicks: stats.clicks || 0,
-            impressions: stats.impressions || 0,
-            cpm: stats.cpm || 0,
-            rpm: stats.rpm || 0,
-            revenue: stats.revenue || 0,
-        });
-    } catch (error) {
-        console.error('User link stats error:', error);
-        res.status(500).json({ 
-            message: 'Failed to fetch link stats', 
-            error: error.message 
-        });
-    }
-});
-
-// ============================================
-// 13. ROOT / HEALTH CHECK
+// 12. ROOT / HEALTH CHECK
 // ============================================
 app.get('/api', (req, res) => {
     res.json({
