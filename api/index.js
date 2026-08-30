@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Real Smartlink Names (alias) + URL + Signup + Analytics
+// Real Smartlink Names (alias) + URL + Signup + Analytics + Charts + Compare
 // ============================================
 
 const express = require('express');
@@ -364,7 +364,6 @@ app.post('/api/auth/user-login', async (req, res) => {
     }
 });
 
-// ----- USER SIGNUP (NEW) -----
 app.post('/api/auth/user-signup', async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -375,16 +374,14 @@ app.post('/api/auth/user-signup', async (req, res) => {
             return res.status(400).json({ message: 'Password must be at least 6 characters' });
         }
 
-        // 1. Create user in Firebase Auth
         const userRecord = await admin.auth().createUser({
             email: email,
             password: password,
             emailVerified: false,
             disabled: false,
-            displayName: name, // set displayName in Auth
+            displayName: name,
         });
 
-        // 2. Save to Firestore with default permissions
         await db.collection('users').doc(userRecord.uid).set({
             email: email,
             displayName: name,
@@ -707,20 +704,19 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
 });
 
 // ============================================
-// 11. USER ANALYTICS (NEW)
+// 11. USER ANALYTICS
 // ============================================
 app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
     try {
         const currentUid = req.user.uid;
 
-        // 1. Fetch all users with role 'user' except the current user
         const usersSnapshot = await db.collection('users')
             .where('role', '==', 'user')
             .get();
 
         const otherUsers = [];
         for (const doc of usersSnapshot.docs) {
-            if (doc.id === currentUid) continue; // exclude self
+            if (doc.id === currentUid) continue;
             const data = doc.data();
             otherUsers.push({
                 uid: doc.id,
@@ -729,14 +725,12 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             });
         }
 
-        // 2. For each user, get total daily clicks from all their assigned smartlinks
         const today = new Date().toISOString().split('T')[0];
-        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0]; // next day
+        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
         const analytics = [];
 
         for (const user of otherUsers) {
-            // Fetch assignments for this user
             const assignmentsSnapshot = await db.collection('assignments')
                 .where('userId', '==', user.uid)
                 .get();
@@ -748,13 +742,11 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
                     const assignmentData = doc.data();
                     const smartlinkId = assignmentData.smartlinkId;
                     try {
-                        // Get today's stats for this smartlink
                         const rawStats = await fetchStatsFromAdsterra(today, tomorrow, smartlinkId);
                         const clicks = rawStats.clicks || 0;
                         totalClicks += clicks;
                     } catch (error) {
                         console.warn(`⚠️ Failed to fetch stats for link ${smartlinkId} for user ${user.email}:`, error.message);
-                        // Skip this link, continue with others
                     }
                 }
             }
@@ -766,7 +758,6 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             });
         }
 
-        // Sort by total clicks descending (optional)
         analytics.sort((a, b) => b.totalClicks - a.totalClicks);
 
         res.json({
@@ -780,12 +771,130 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
 });
 
 // ============================================
-// 12. ROOT / HEALTH CHECK
+// 12. ADMIN CHART DATA (NEW)
+// ============================================
+app.get('/api/admin/chart-data', authMiddleware('admin'), async (req, res) => {
+    try {
+        // Get all smartlinks (to know which links exist)
+        const adsterraLinks = await fetchSmartlinksFromAdsterra();
+        const linkIds = adsterraLinks.map(l => l.id);
+
+        // Get last 7 days
+        const days = [];
+        const clicksData = [];
+        const impressionsData = [];
+        const labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+        for (let i = 6; i >= 0; i--) {
+            const date = new Date();
+            date.setDate(date.getDate() - i);
+            const dateStr = date.toISOString().split('T')[0];
+            const nextDate = new Date(date);
+            nextDate.setDate(nextDate.getDate() + 1);
+            const nextDateStr = nextDate.toISOString().split('T')[0];
+            days.push(dateStr);
+
+            // Fetch stats for all links on this day (aggregate)
+            let totalClicks = 0;
+            let totalImpressions = 0;
+
+            for (const linkId of linkIds) {
+                try {
+                    const stats = await fetchStatsFromAdsterra(dateStr, nextDateStr, linkId);
+                    totalClicks += stats.clicks || 0;
+                    totalImpressions += stats.impressions || 0;
+                } catch (error) {
+                    // Skip this link if stats fail
+                }
+            }
+
+            clicksData.push(totalClicks);
+            impressionsData.push(totalImpressions);
+        }
+
+        res.json({
+            labels: labels,
+            clicks: clicksData,
+            impressions: impressionsData,
+        });
+    } catch (error) {
+        console.error('Chart data error:', error);
+        res.status(500).json({ message: 'Failed to fetch chart data' });
+    }
+});
+
+// ============================================
+// 13. USER CHART DATA (NEW)
+// ============================================
+app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+
+        const userDoc = await db.collection('users').doc(uid).get();
+        if (!userDoc.exists) return res.status(404).json({ message: 'User not found' });
+
+        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+        const linkIds = [];
+        assignmentsSnapshot.forEach(doc => {
+            const data = doc.data();
+            linkIds.push(data.smartlinkId);
+        });
+
+        if (linkIds.length === 0) {
+            return res.json({
+                labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                clicks: [0, 0, 0, 0, 0, 0, 0],
+                impressions: [0, 0, 0, 0, 0, 0, 0],
+            });
+        }
+
+        const labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+        const clicksData = [];
+        const impressionsData = [];
+
+        for (let i = 6; i >= 0; i--) {
+            const date = new Date();
+            date.setDate(date.getDate() - i);
+            const dateStr = date.toISOString().split('T')[0];
+            const nextDate = new Date(date);
+            nextDate.setDate(nextDate.getDate() + 1);
+            const nextDateStr = nextDate.toISOString().split('T')[0];
+
+            let totalClicks = 0;
+            let totalImpressions = 0;
+
+            for (const linkId of linkIds) {
+                try {
+                    const stats = await fetchStatsFromAdsterra(dateStr, nextDateStr, linkId);
+                    totalClicks += stats.clicks || 0;
+                    totalImpressions += stats.impressions || 0;
+                } catch (error) {
+                    // Skip
+                }
+            }
+
+            clicksData.push(totalClicks);
+            impressionsData.push(totalImpressions);
+        }
+
+        res.json({
+            labels: labels,
+            clicks: clicksData,
+            impressions: impressionsData,
+        });
+    } catch (error) {
+        console.error('User chart data error:', error);
+        res.status(500).json({ message: 'Failed to fetch user chart data' });
+    }
+});
+
+// ============================================
+// 14. ROOT / HEALTH CHECK
 // ============================================
 app.get('/api', (req, res) => {
     res.json({
         name: 'Lunar Metrics API',
-        version: '1.0.0',
+        version: '2.0.0',
         status: 'operational',
         timestamp: new Date().toISOString(),
     });
