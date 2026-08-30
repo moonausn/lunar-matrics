@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Real Smartlink Names (alias) + URL + Signup + Analytics
+// Real Smartlink Names (alias) + URL + Signup + Analytics + Charts + Compare + Search
 // ============================================
 
 const express = require('express');
@@ -258,7 +258,7 @@ const fetchSmartlinksFromAdsterra = async () => {
 };
 
 /**
- * Fetch statistics for a specific smartlink for a given date range
+ * Fetch statistics for a specific smartlink for a given date range (aggregated)
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
@@ -306,6 +306,33 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     }
 };
 
+/**
+ * NEW: Fetch daily stats for a link over a number of days (real per-day calls)
+ * Returns array of { date, impressions, clicks, revenue }
+ */
+const fetchDailyStatsForLink = async (smartlinkId, days = 7) => {
+    const dailyData = [];
+    const now = new Date();
+    for (let i = days - 1; i >= 0; i--) {
+        const d = new Date(now);
+        d.setDate(d.getDate() - i);
+        const dateStr = d.toISOString().split('T')[0];
+        const nextDay = new Date(d);
+        nextDay.setDate(nextDay.getDate() + 1);
+        const nextDateStr = nextDay.toISOString().split('T')[0];
+
+        // Fetch stats for this single day
+        const stats = await fetchStatsFromAdsterra(dateStr, nextDateStr, smartlinkId);
+        dailyData.push({
+            date: dateStr,
+            impressions: stats.impressions || 0,
+            clicks: stats.clicks || 0,
+            revenue: stats.revenue || 0
+        });
+    }
+    return dailyData;
+};
+
 const mapStatsToMetrics = (rawStats) => ({
     impressions: rawStats.impressions || 0,
     clicks: rawStats.clicks || 0,
@@ -314,9 +341,9 @@ const mapStatsToMetrics = (rawStats) => ({
     revenue: rawStats.revenue || 0,
 });
 
-// ============================================
+// -----------------------------
 // 7. AUTH ENDPOINTS (including signup)
-// ============================================
+// -----------------------------
 
 app.post('/api/auth/admin-login', async (req, res) => {
     try {
@@ -364,7 +391,6 @@ app.post('/api/auth/user-login', async (req, res) => {
     }
 });
 
-// ----- USER SIGNUP (NEW) -----
 app.post('/api/auth/user-signup', async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -375,16 +401,14 @@ app.post('/api/auth/user-signup', async (req, res) => {
             return res.status(400).json({ message: 'Password must be at least 6 characters' });
         }
 
-        // 1. Create user in Firebase Auth
         const userRecord = await admin.auth().createUser({
             email: email,
             password: password,
             emailVerified: false,
             disabled: false,
-            displayName: name, // set displayName in Auth
+            displayName: name,
         });
 
-        // 2. Save to Firestore with default permissions
         await db.collection('users').doc(userRecord.uid).set({
             email: email,
             displayName: name,
@@ -413,9 +437,9 @@ app.post('/api/auth/user-signup', async (req, res) => {
     }
 });
 
-// ============================================
+// -----------------------------
 // 8. ADMIN ENDPOINTS
-// ============================================
+// -----------------------------
 
 app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
     try {
@@ -453,10 +477,12 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
     }
 });
 
+// UPDATED: /api/admin/users with search and filter support
 app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
     try {
-        const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
-        const users = [];
+        const { search, filter } = req.query;
+        let usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
+        let users = [];
         for (const doc of usersSnapshot.docs) {
             const data = doc.data();
             const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', doc.id).get();
@@ -477,6 +503,24 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
                 assignedLinks: smartlinkNames,
             });
         }
+
+        // Apply search filter (client-side simulation for now, but we do server-side)
+        if (search) {
+            const s = search.toLowerCase();
+            users = users.filter(u =>
+                u.email.toLowerCase().includes(s) ||
+                (u.displayName && u.displayName.toLowerCase().includes(s)) ||
+                (u.smartlinkName && u.smartlinkName.toLowerCase().includes(s)) ||
+                u.id.toLowerCase().includes(s)
+            );
+        }
+
+        if (filter === 'assigned') {
+            users = users.filter(u => u.smartlinkName && u.smartlinkName !== '—' && u.smartlinkName !== null);
+        } else if (filter === 'unassigned') {
+            users = users.filter(u => !u.smartlinkName || u.smartlinkName === '—' || u.smartlinkName === null);
+        }
+
         res.json(users);
     } catch (error) {
         console.error('Users fetch error:', error);
@@ -614,9 +658,9 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
     }
 });
 
-// ============================================
+// -----------------------------
 // 9. FIX EXISTING ASSIGNMENT NAMES
-// ============================================
+// -----------------------------
 app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
     try {
         console.log('🔄 Starting name fix for all assignments...');
@@ -657,9 +701,9 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
     }
 });
 
-// ============================================
+// -----------------------------
 // 10. USER STATS
-// ============================================
+// -----------------------------
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -706,21 +750,20 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     }
 });
 
-// ============================================
-// 11. USER ANALYTICS (NEW)
-// ============================================
+// -----------------------------
+// 11. USER ANALYTICS
+// -----------------------------
 app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
     try {
         const currentUid = req.user.uid;
 
-        // 1. Fetch all users with role 'user' except the current user
         const usersSnapshot = await db.collection('users')
             .where('role', '==', 'user')
             .get();
 
         const otherUsers = [];
         for (const doc of usersSnapshot.docs) {
-            if (doc.id === currentUid) continue; // exclude self
+            if (doc.id === currentUid) continue;
             const data = doc.data();
             otherUsers.push({
                 uid: doc.id,
@@ -729,14 +772,12 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             });
         }
 
-        // 2. For each user, get total daily clicks from all their assigned smartlinks
         const today = new Date().toISOString().split('T')[0];
-        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0]; // next day
+        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
         const analytics = [];
 
         for (const user of otherUsers) {
-            // Fetch assignments for this user
             const assignmentsSnapshot = await db.collection('assignments')
                 .where('userId', '==', user.uid)
                 .get();
@@ -748,13 +789,11 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
                     const assignmentData = doc.data();
                     const smartlinkId = assignmentData.smartlinkId;
                     try {
-                        // Get today's stats for this smartlink
                         const rawStats = await fetchStatsFromAdsterra(today, tomorrow, smartlinkId);
                         const clicks = rawStats.clicks || 0;
                         totalClicks += clicks;
                     } catch (error) {
                         console.warn(`⚠️ Failed to fetch stats for link ${smartlinkId} for user ${user.email}:`, error.message);
-                        // Skip this link, continue with others
                     }
                 }
             }
@@ -766,7 +805,6 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             });
         }
 
-        // Sort by total clicks descending (optional)
         analytics.sort((a, b) => b.totalClicks - a.totalClicks);
 
         res.json({
@@ -779,13 +817,112 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
     }
 });
 
-// ============================================
-// 12. ROOT / HEALTH CHECK
-// ============================================
+// -----------------------------
+// 12. NEW: CHART DATA ENDPOINTS (REAL DAILY STATS)
+// -----------------------------
+
+/**
+ * Helper: Aggregate daily stats across multiple links
+ */
+const aggregateDailyStats = async (linkIds, days) => {
+    const dailyMap = {};
+    // Initialize all days
+    const now = new Date();
+    for (let i = days - 1; i >= 0; i--) {
+        const d = new Date(now);
+        d.setDate(d.getDate() - i);
+        const dateStr = d.toISOString().split('T')[0];
+        dailyMap[dateStr] = { date: dateStr, impressions: 0, clicks: 0, revenue: 0 };
+    }
+
+    // For each link, fetch daily stats and add to map
+    for (const linkId of linkIds) {
+        try {
+            const dailyStats = await fetchDailyStatsForLink(linkId, days);
+            dailyStats.forEach(day => {
+                if (dailyMap[day.date]) {
+                    dailyMap[day.date].impressions += day.impressions;
+                    dailyMap[day.date].clicks += day.clicks;
+                    dailyMap[day.date].revenue += day.revenue;
+                }
+            });
+        } catch (err) {
+            console.warn(`Failed to fetch daily stats for link ${linkId}:`, err.message);
+        }
+    }
+
+    // Convert map to sorted array
+    const sortedDates = Object.keys(dailyMap).sort();
+    return sortedDates.map(date => dailyMap[date]);
+};
+
+// Admin chart data endpoint
+app.get('/api/admin/chart-data', authMiddleware('admin'), async (req, res) => {
+    try {
+        const days = parseInt(req.query.days) || 7;
+        if (days < 1 || days > 90) return res.status(400).json({ message: 'Days must be between 1 and 90' });
+
+        // Get all smartlinks from Adsterra
+        const allLinks = await fetchSmartlinksFromAdsterra();
+        const linkIds = allLinks.map(l => l.id);
+
+        if (linkIds.length === 0) {
+            return res.json({ labels: [], impressions: [], clicks: [], revenue: [] });
+        }
+
+        const dailyData = await aggregateDailyStats(linkIds, days);
+
+        const labels = dailyData.map(d => d.date);
+        const impressions = dailyData.map(d => d.impressions);
+        const clicks = dailyData.map(d => d.clicks);
+        const revenue = dailyData.map(d => d.revenue);
+
+        res.json({ labels, impressions, clicks, revenue });
+    } catch (error) {
+        console.error('Admin chart data error:', error);
+        res.status(500).json({ message: 'Failed to fetch chart data', error: error.message });
+    }
+});
+
+// User chart data endpoint
+app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
+    try {
+        const days = parseInt(req.query.days) || 7;
+        if (days < 1 || days > 90) return res.status(400).json({ message: 'Days must be between 1 and 90' });
+
+        const uid = req.user.uid;
+        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+        const linkIds = [];
+        assignmentsSnapshot.forEach(doc => {
+            const data = doc.data();
+            if (data.smartlinkId) linkIds.push(data.smartlinkId);
+        });
+
+        if (linkIds.length === 0) {
+            return res.json({ labels: [], impressions: [], clicks: [], revenue: [] });
+        }
+
+        const dailyData = await aggregateDailyStats(linkIds, days);
+
+        const labels = dailyData.map(d => d.date);
+        const impressions = dailyData.map(d => d.impressions);
+        const clicks = dailyData.map(d => d.clicks);
+        const revenue = dailyData.map(d => d.revenue);
+
+        res.json({ labels, impressions, clicks, revenue });
+    } catch (error) {
+        console.error('User chart data error:', error);
+        res.status(500).json({ message: 'Failed to fetch chart data', error: error.message });
+    }
+});
+
+// -----------------------------
+// 13. ROOT / HEALTH CHECK
+// -----------------------------
 app.get('/api', (req, res) => {
     res.json({
         name: 'Lunar Metrics API',
-        version: '1.0.0',
+        version: '1.1.0',
         status: 'operational',
         timestamp: new Date().toISOString(),
     });
