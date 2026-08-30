@@ -1,6 +1,6 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
-// Real Smartlink Names (alias) + URL + Signup + Analytics + Charts
+// Real Smartlink Names (alias) + URL + Signup + Analytics + Charts + Compare
 // ============================================
 
 const express = require('express');
@@ -259,7 +259,7 @@ const fetchSmartlinksFromAdsterra = async () => {
 
 /**
  * Fetch statistics for a specific smartlink for a given date range
- * Returns an array of daily stats if the API supports it, or a single aggregated object.
+ * Returns aggregated stats for that period.
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
@@ -287,27 +287,23 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
         });
 
         let statsData = response.data;
-        // Try to extract items array
         if (statsData.data && statsData.data.items) {
             statsData = statsData.data.items;
-        } else if (statsData.data && Array.isArray(statsData.data)) {
-            statsData = statsData.data;
-        } else if (statsData.items && Array.isArray(statsData.items)) {
-            statsData = statsData.items;
         }
-
-        // If statsData is an array, return it as-is (daily data)
-        // Otherwise, wrap it in an array or return empty.
         if (Array.isArray(statsData)) {
-            return statsData;
-        } else if (statsData && typeof statsData === 'object') {
-            // It might be a single stats object (aggregated for the date range)
-            return [statsData];
+            if (smartlinkId) {
+                const found = statsData.find(item =>
+                    (item.placement_id && item.placement_id == smartlinkId) ||
+                    (item.smartlink_id && item.smartlink_id == smartlinkId)
+                );
+                return found || {};
+            }
+            return statsData.length > 0 ? statsData[0] : {};
         }
-        return [];
+        return statsData || {};
     } catch (error) {
         console.error('Adsterra Stats fetch error:', error.message);
-        return [];
+        return { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
     }
 };
 
@@ -318,6 +314,17 @@ const mapStatsToMetrics = (rawStats) => ({
     rpm: rawStats.rpm || 0,
     revenue: rawStats.revenue || 0,
 });
+
+// Helper to generate date range array
+const getDateRange = (days) => {
+    const dates = [];
+    for (let i = days - 1; i >= 0; i--) {
+        const d = new Date();
+        d.setDate(d.getDate() - i);
+        dates.push(d.toISOString().split('T')[0]);
+    }
+    return dates;
+};
 
 // ============================================
 // 7. AUTH ENDPOINTS (including signup)
@@ -685,20 +692,7 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
 
                 try {
                     const rawStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, smartlinkId);
-                    // If rawStats is an array, aggregate or take first.
-                    let aggregated = { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
-                    if (Array.isArray(rawStats)) {
-                        rawStats.forEach(day => {
-                            aggregated.impressions += day.impressions || 0;
-                            aggregated.clicks += day.clicks || 0;
-                            aggregated.cpm += day.cpm || 0;
-                            aggregated.rpm += day.rpm || 0;
-                            aggregated.revenue += day.revenue || 0;
-                        });
-                    } else if (rawStats && typeof rawStats === 'object') {
-                        aggregated = rawStats;
-                    }
-                    const metrics = mapStatsToMetrics(aggregated);
+                    const metrics = mapStatsToMetrics(rawStats);
                     smartlinks.push({ id: smartlinkId, name: smartlinkName, metrics });
                 } catch (error) {
                     console.warn(`⚠️ Failed to fetch stats for link ${smartlinkId}:`, error.message);
@@ -762,12 +756,7 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
                     const smartlinkId = assignmentData.smartlinkId;
                     try {
                         const rawStats = await fetchStatsFromAdsterra(today, tomorrow, smartlinkId);
-                        let clicks = 0;
-                        if (Array.isArray(rawStats)) {
-                            rawStats.forEach(day => { clicks += day.clicks || 0; });
-                        } else if (rawStats && typeof rawStats === 'object') {
-                            clicks = rawStats.clicks || 0;
-                        }
+                        const clicks = rawStats.clicks || 0;
                         totalClicks += clicks;
                     } catch (error) {
                         console.warn(`⚠️ Failed to fetch stats for link ${smartlinkId} for user ${user.email}:`, error.message);
@@ -795,108 +784,203 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
 });
 
 // ============================================
-// 12. USER CHART DATA (NEW – REAL DATA)
+// 12. CHARTS & COMPARE ENDPOINTS (NEW - REAL DATA)
 // ============================================
-app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
+
+/**
+ * ADMIN CHART: Get daily aggregated clicks/impressions for ALL links.
+ * Real data fetched from Adsterra for each day in the range.
+ */
+app.get('/api/admin/chart', authMiddleware('admin'), async (req, res) => {
     try {
-        const uid = req.user.uid;
+        const days = parseInt(req.query.days) || 7;
+        const maxDays = 30;
+        const actualDays = Math.min(days, maxDays);
 
-        // Get user's assigned links
-        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
-        if (assignmentsSnapshot.empty) {
-            return res.json({
-                labels: [],
-                clicks: [],
-                impressions: [],
-                message: 'No assigned links found.',
-            });
+        // 1. Fetch all smartlinks from Adsterra
+        const allLinks = await fetchSmartlinksFromAdsterra();
+        if (allLinks.length === 0) {
+            return res.json({ labels: [], clicks: [], impressions: [] });
         }
 
-        // Prepare date range: last 7 days
-        const days = 7;
-        const labels = [];
-        const dateMap = {};
-
-        // Generate labels and date keys for the last 7 days
-        for (let i = days - 1; i >= 0; i--) {
-            const d = new Date();
-            d.setDate(d.getDate() - i);
-            const dateStr = d.toISOString().split('T')[0];
-            const display = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-            labels.push(display);
-            dateMap[dateStr] = { clicks: 0, impressions: 0 };
-        }
-
-        // Fetch stats for each assigned link and aggregate by date
-        for (const doc of assignmentsSnapshot.docs) {
-            const assignmentData = doc.data();
-            const smartlinkId = assignmentData.smartlinkId;
-            const dateFrom = new Date();
-            dateFrom.setDate(dateFrom.getDate() - (days - 1));
-            const fromStr = dateFrom.toISOString().split('T')[0];
-            const toStr = new Date().toISOString().split('T')[0];
-
-            try {
-                const rawStats = await fetchStatsFromAdsterra(fromStr, toStr, smartlinkId);
-                if (Array.isArray(rawStats)) {
-                    // Each entry should have a date field; use the date from the API response
-                    rawStats.forEach(entry => {
-                        // Try to find date field: could be 'date', 'day', 'created_at', etc.
-                        let dateStr = entry.date || entry.day || entry.created_at || '';
-                        if (dateStr) {
-                            // Extract YYYY-MM-DD
-                            dateStr = dateStr.split('T')[0];
-                        } else {
-                            // If no date, we can't aggregate by day. Skip or use fallback.
-                            return;
-                        }
-                        if (dateMap[dateStr]) {
-                            dateMap[dateStr].clicks += entry.clicks || 0;
-                            dateMap[dateStr].impressions += entry.impressions || 0;
-                        }
-                    });
-                } else if (rawStats && typeof rawStats === 'object') {
-                    // Single aggregated response (should have date or we use the from date)
-                    // We'll assign it to the latest date? Or we can distribute evenly? This is less likely.
-                    // For simplicity, we'll add to today's date.
-                    const todayStr = new Date().toISOString().split('T')[0];
-                    if (dateMap[todayStr]) {
-                        dateMap[todayStr].clicks += rawStats.clicks || 0;
-                        dateMap[todayStr].impressions += rawStats.impressions || 0;
-                    }
-                }
-            } catch (error) {
-                console.warn(`⚠️ Failed to fetch chart stats for link ${smartlinkId}:`, error.message);
-            }
-        }
-
-        // Build the final arrays in label order
+        // 2. Generate date range
+        const dateLabels = [];
         const clicksData = [];
         const impressionsData = [];
-        for (const label of labels) {
-            // Find the date key corresponding to this label. Since labels are in order, we can match by index.
-            // But we need to map label back to date. We'll use the dateMap keys.
-            // We'll iterate over dateMap in sorted order.
-            const sortedDates = Object.keys(dateMap).sort();
-            // But dateMap keys are in order because we inserted in chronological order.
-            // However, we inserted from oldest to newest, so we can just push.
-        }
+        const dateStrings = getDateRange(actualDays);
 
-        // Since we inserted dateMap in chronological order, we can just iterate over sorted keys.
-        const sortedKeys = Object.keys(dateMap).sort();
-        for (const key of sortedKeys) {
-            clicksData.push(dateMap[key].clicks);
-            impressionsData.push(dateMap[key].impressions);
+        // 3. For each date, fetch stats for all links and aggregate
+        for (const dateStr of dateStrings) {
+            const nextDate = new Date(dateStr);
+            nextDate.setDate(nextDate.getDate() + 1);
+            const nextDateStr = nextDate.toISOString().split('T')[0];
+
+            let dailyClicks = 0;
+            let dailyImpressions = 0;
+
+            // Fetch stats for each link on this specific date
+            const linkPromises = allLinks.map(link => 
+                fetchStatsFromAdsterra(dateStr, nextDateStr, link.id)
+            );
+            
+            const results = await Promise.all(linkPromises);
+            
+            results.forEach(stats => {
+                dailyClicks += (stats.clicks || 0);
+                dailyImpressions += (stats.impressions || 0);
+            });
+
+            dateLabels.push(dateStr);
+            clicksData.push(dailyClicks);
+            impressionsData.push(dailyImpressions);
         }
 
         res.json({
-            labels: labels,
+            labels: dateLabels,
             clicks: clicksData,
             impressions: impressionsData,
         });
     } catch (error) {
-        console.error('Chart data error:', error);
-        res.status(500).json({ message: 'Failed to fetch chart data' });
+        console.error('Admin chart error:', error);
+        res.status(500).json({ 
+            message: 'Failed to fetch chart data', 
+            error: error.message 
+        });
+    }
+});
+
+/**
+ * USER CHART: Get daily aggregated clicks/impressions for user's assigned links.
+ * Real data fetched from Adsterra for each day in the range.
+ */
+app.get('/api/user/chart', authMiddleware('user'), async (req, res) => {
+    try {
+        const days = parseInt(req.query.days) || 7;
+        const maxDays = 30;
+        const actualDays = Math.min(days, maxDays);
+        const uid = req.user.uid;
+
+        // 1. Get user's assigned links from Firestore
+        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+        
+        if (assignmentsSnapshot.empty) {
+            return res.json({ labels: [], clicks: [], impressions: [] });
+        }
+
+        const userLinks = [];
+        assignmentsSnapshot.forEach(doc => {
+            const data = doc.data();
+            userLinks.push({
+                id: data.smartlinkId,
+                name: data.smartlinkName || data.smartlinkId,
+            });
+        });
+
+        // 2. Generate date range
+        const dateLabels = [];
+        const clicksData = [];
+        const impressionsData = [];
+        const dateStrings = getDateRange(actualDays);
+
+        // 3. For each date, fetch stats for user's links and aggregate
+        for (const dateStr of dateStrings) {
+            const nextDate = new Date(dateStr);
+            nextDate.setDate(nextDate.getDate() + 1);
+            const nextDateStr = nextDate.toISOString().split('T')[0];
+
+            let dailyClicks = 0;
+            let dailyImpressions = 0;
+
+            const linkPromises = userLinks.map(link => 
+                fetchStatsFromAdsterra(dateStr, nextDateStr, link.id)
+            );
+            
+            const results = await Promise.all(linkPromises);
+            
+            results.forEach(stats => {
+                dailyClicks += (stats.clicks || 0);
+                dailyImpressions += (stats.impressions || 0);
+            });
+
+            dateLabels.push(dateStr);
+            clicksData.push(dailyClicks);
+            impressionsData.push(dailyImpressions);
+        }
+
+        res.json({
+            labels: dateLabels,
+            clicks: clicksData,
+            impressions: impressionsData,
+        });
+    } catch (error) {
+        console.error('User chart error:', error);
+        res.status(500).json({ 
+            message: 'Failed to fetch chart data', 
+            error: error.message 
+        });
+    }
+});
+
+/**
+ * ADMIN LINK STATS: Get stats for a specific link (for comparison).
+ * Real data fetched from Adsterra.
+ */
+app.get('/api/admin/link-stats', authMiddleware('admin'), async (req, res) => {
+    try {
+        const { id, from, to } = req.query;
+        if (!id || !from || !to) {
+            return res.status(400).json({ message: 'Missing id, from, or to parameters' });
+        }
+
+        const stats = await fetchStatsFromAdsterra(from, to, id);
+        res.json({
+            clicks: stats.clicks || 0,
+            impressions: stats.impressions || 0,
+            cpm: stats.cpm || 0,
+            rpm: stats.rpm || 0,
+            revenue: stats.revenue || 0,
+        });
+    } catch (error) {
+        console.error('Admin link stats error:', error);
+        res.status(500).json({ 
+            message: 'Failed to fetch link stats', 
+            error: error.message 
+        });
+    }
+});
+
+/**
+ * USER LINK STATS: Get stats for a specific user link (for comparison).
+ * Real data fetched from Adsterra.
+ */
+app.get('/api/user/link-stats', authMiddleware('user'), async (req, res) => {
+    try {
+        const { id, from, to } = req.query;
+        if (!id || !from || !to) {
+            return res.status(400).json({ message: 'Missing id, from, or to parameters' });
+        }
+
+        // Verify the user actually has this link assigned
+        const uid = req.user.uid;
+        const assignmentDoc = await db.collection('assignments').doc(id).get();
+        if (!assignmentDoc.exists || assignmentDoc.data().userId !== uid) {
+            return res.status(403).json({ message: 'You do not have access to this link' });
+        }
+
+        const stats = await fetchStatsFromAdsterra(from, to, id);
+        res.json({
+            clicks: stats.clicks || 0,
+            impressions: stats.impressions || 0,
+            cpm: stats.cpm || 0,
+            rpm: stats.rpm || 0,
+            revenue: stats.revenue || 0,
+        });
+    } catch (error) {
+        console.error('User link stats error:', error);
+        res.status(500).json({ 
+            message: 'Failed to fetch link stats', 
+            error: error.message 
+        });
     }
 });
 
