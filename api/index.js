@@ -1,6 +1,7 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND
 // Real Smartlink Names (alias) + URL + Signup + Analytics + Charts + Compare + Search
+// + Goals + Leaderboard + Multi-Currency (USD/PKR)
 // ============================================
 
 const express = require('express');
@@ -422,6 +423,7 @@ app.post('/api/auth/user-signup', async (req, res) => {
                 revenue: true,
             },
             smartlinkId: null,
+            currencyPreference: 'USD', // NEW: default currency
         });
 
         res.status(201).json({
@@ -501,6 +503,7 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
                 smartlinkId: data.smartlinkId || null,
                 smartlinkName: smartlinkNames.length > 0 ? smartlinkNames.join(', ') : null,
                 assignedLinks: smartlinkNames,
+                currencyPreference: data.currencyPreference || 'USD', // NEW
             });
         }
 
@@ -540,6 +543,7 @@ app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
             smartlinkId: null,
+            currencyPreference: 'USD', // NEW
         });
 
         res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
@@ -817,9 +821,302 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
     }
 });
 
-// -----------------------------
-// 12. NEW: CHART DATA ENDPOINTS (REAL DAILY STATS)
-// -----------------------------
+// ================================================================
+// 12. NEW: GOALS ENDPOINTS
+// ================================================================
+
+/**
+ * Helper: Get aggregated stats for a user across all their links for a date range
+ */
+const getUserAggregatedStats = async (uid, dateFrom, dateTo) => {
+    const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+    if (assignmentsSnapshot.empty) {
+        return { impressions: 0, clicks: 0, revenue: 0, cpm: 0, rpm: 0 };
+    }
+
+    let totalImpressions = 0;
+    let totalClicks = 0;
+    let totalRevenue = 0;
+    let totalCpm = 0;
+    let totalRpm = 0;
+    let count = 0;
+
+    for (const doc of assignmentsSnapshot.docs) {
+        const data = doc.data();
+        const smartlinkId = data.smartlinkId;
+        try {
+            const rawStats = await fetchStatsFromAdsterra(dateFrom, dateTo, smartlinkId);
+            totalImpressions += rawStats.impressions || 0;
+            totalClicks += rawStats.clicks || 0;
+            totalRevenue += rawStats.revenue || 0;
+            totalCpm += rawStats.cpm || 0;
+            totalRpm += rawStats.rpm || 0;
+            count++;
+        } catch (error) {
+            console.warn(`⚠️ Failed to fetch stats for goal aggregation (link ${smartlinkId}):`, error.message);
+        }
+    }
+
+    return {
+        impressions: totalImpressions,
+        clicks: totalClicks,
+        revenue: totalRevenue,
+        cpm: count > 0 ? totalCpm / count : 0,
+        rpm: count > 0 ? totalRpm / count : 0,
+    };
+};
+
+// GET /api/user/goals
+app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+
+        // Fetch goals from Firestore subcollection
+        const goalsSnapshot = await db.collection('users').doc(uid).collection('goals').get();
+        if (goalsSnapshot.empty) {
+            return res.json({ goals: [] });
+        }
+
+        // Get current stats for the user (last 30 days for progress)
+        const today = new Date().toISOString().split('T')[0];
+        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const currentStats = await getUserAggregatedStats(uid, thirtyDaysAgo, today);
+
+        const goals = [];
+        goalsSnapshot.forEach(doc => {
+            const data = doc.data();
+            const goalId = doc.id;
+
+            // Calculate current value and progress based on type
+            let current = 0;
+            switch (data.type) {
+                case 'revenue':
+                    current = currentStats.revenue || 0;
+                    break;
+                case 'clicks':
+                    current = currentStats.clicks || 0;
+                    break;
+                case 'impressions':
+                    current = currentStats.impressions || 0;
+                    break;
+                case 'rpm':
+                    current = currentStats.rpm || 0;
+                    break;
+                default:
+                    current = 0;
+            }
+
+            const target = data.target || 1;
+            const progress = target > 0 ? Math.min((current / target) * 100, 100) : 0;
+
+            goals.push({
+                id: goalId,
+                type: data.type,
+                title: data.title || data.type.charAt(0).toUpperCase() + data.type.slice(1),
+                target: data.target,
+                current: current,
+                progress: progress,
+                deadline: data.deadline || null,
+                createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : new Date().toISOString(),
+                updatedAt: data.updatedAt ? data.updatedAt.toDate().toISOString() : new Date().toISOString(),
+            });
+        });
+
+        res.json({ goals });
+    } catch (error) {
+        console.error('Get goals error:', error);
+        res.status(500).json({ message: 'Failed to fetch goals', error: error.message });
+    }
+});
+
+// POST /api/user/goals
+app.post('/api/user/goals', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { type, target, deadline } = req.body;
+
+        if (!type || !target || target <= 0) {
+            return res.status(400).json({ message: 'Type and valid target are required.' });
+        }
+
+        const validTypes = ['revenue', 'clicks', 'impressions', 'rpm'];
+        if (!validTypes.includes(type)) {
+            return res.status(400).json({ message: 'Invalid goal type.' });
+        }
+
+        const goalData = {
+            type,
+            target: parseFloat(target),
+            deadline: deadline || null,
+            title: type.charAt(0).toUpperCase() + type.slice(1),
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+
+        const docRef = await db.collection('users').doc(uid).collection('goals').add(goalData);
+
+        res.status(201).json({
+            message: 'Goal created successfully!',
+            goalId: docRef.id,
+        });
+    } catch (error) {
+        console.error('Create goal error:', error);
+        res.status(500).json({ message: 'Failed to create goal', error: error.message });
+    }
+});
+
+// PUT /api/user/goals/:goalId
+app.put('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { goalId } = req.params;
+        const { type, target, deadline } = req.body;
+
+        if (!goalId) {
+            return res.status(400).json({ message: 'Goal ID required.' });
+        }
+
+        if (!type || !target || target <= 0) {
+            return res.status(400).json({ message: 'Type and valid target are required.' });
+        }
+
+        const validTypes = ['revenue', 'clicks', 'impressions', 'rpm'];
+        if (!validTypes.includes(type)) {
+            return res.status(400).json({ message: 'Invalid goal type.' });
+        }
+
+        const goalRef = db.collection('users').doc(uid).collection('goals').doc(goalId);
+        const goalDoc = await goalRef.get();
+
+        if (!goalDoc.exists) {
+            return res.status(404).json({ message: 'Goal not found.' });
+        }
+
+        await goalRef.update({
+            type,
+            target: parseFloat(target),
+            deadline: deadline || null,
+            title: type.charAt(0).toUpperCase() + type.slice(1),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        res.json({ message: 'Goal updated successfully!' });
+    } catch (error) {
+        console.error('Update goal error:', error);
+        res.status(500).json({ message: 'Failed to update goal', error: error.message });
+    }
+});
+
+// DELETE /api/user/goals/:goalId
+app.delete('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { goalId } = req.params;
+
+        if (!goalId) {
+            return res.status(400).json({ message: 'Goal ID required.' });
+        }
+
+        const goalRef = db.collection('users').doc(uid).collection('goals').doc(goalId);
+        const goalDoc = await goalRef.get();
+
+        if (!goalDoc.exists) {
+            return res.status(404).json({ message: 'Goal not found.' });
+        }
+
+        await goalRef.delete();
+
+        res.json({ message: 'Goal deleted successfully!' });
+    } catch (error) {
+        console.error('Delete goal error:', error);
+        res.status(500).json({ message: 'Failed to delete goal', error: error.message });
+    }
+});
+
+// ================================================================
+// 13. NEW: LEADERBOARD ENDPOINT
+// ================================================================
+
+app.get('/api/leaderboard', authMiddleware('user'), async (req, res) => {
+    try {
+        const { period = 'week' } = req.query;
+
+        // Calculate date range
+        const today = new Date();
+        const todayStr = today.toISOString().split('T')[0];
+        let fromDate = new Date(today);
+        if (period === 'week') {
+            fromDate.setDate(fromDate.getDate() - 7);
+        } else if (period === 'month') {
+            fromDate.setDate(fromDate.getDate() - 30);
+        } else {
+            return res.status(400).json({ message: 'Invalid period. Use "week" or "month".' });
+        }
+        const fromStr = fromDate.toISOString().split('T')[0];
+
+        // Get all users
+        const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
+        if (usersSnapshot.empty) {
+            return res.json({ users: [] });
+        }
+
+        const leaderboardData = [];
+
+        for (const userDoc of usersSnapshot.docs) {
+            const userData = userDoc.data();
+            const uid = userDoc.id;
+
+            // Get assignments for this user
+            const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+            if (assignmentsSnapshot.empty) {
+                // User has no links, skip
+                continue;
+            }
+
+            let totalRevenue = 0;
+
+            // Fetch stats for each assignment and sum revenue
+            const statsPromises = [];
+            assignmentsSnapshot.forEach(doc => {
+                const data = doc.data();
+                const smartlinkId = data.smartlinkId;
+                statsPromises.push(fetchStatsFromAdsterra(fromStr, todayStr, smartlinkId));
+            });
+
+            const statsResults = await Promise.all(statsPromises);
+            statsResults.forEach(stats => {
+                totalRevenue += stats.revenue || 0;
+            });
+
+            leaderboardData.push({
+                uid: uid,
+                email: userData.email,
+                displayName: userData.displayName || userData.email.split('@')[0] || 'User',
+                revenue: totalRevenue,
+            });
+        }
+
+        // Sort by revenue descending
+        leaderboardData.sort((a, b) => b.revenue - a.revenue);
+
+        // Return top 20 or all
+        const topUsers = leaderboardData.slice(0, 20);
+
+        res.json({
+            period: period,
+            from: fromStr,
+            to: todayStr,
+            users: topUsers,
+        });
+    } catch (error) {
+        console.error('Leaderboard error:', error);
+        res.status(500).json({ message: 'Failed to fetch leaderboard', error: error.message });
+    }
+});
+
+// ================================================================
+// 14. OLD: CHART DATA ENDPOINTS (REAL DAILY STATS)
+// ================================================================
 
 /**
  * Helper: Aggregate daily stats across multiple links
@@ -917,12 +1214,12 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 13. ROOT / HEALTH CHECK
+// 15. ROOT / HEALTH CHECK
 // -----------------------------
 app.get('/api', (req, res) => {
     res.json({
         name: 'Lunar Metrics API',
-        version: '1.1.0',
+        version: '1.2.0', // Updated version
         status: 'operational',
         timestamp: new Date().toISOString(),
     });
