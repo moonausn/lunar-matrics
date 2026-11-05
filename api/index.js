@@ -1,26 +1,14 @@
 // ============================================
-// LUNAR METRICS · MASTER BACKEND (v1.4.0)
+// LUNAR METRICS · MASTER BACKEND (v1.5.0)
 // ============================================
-// ORIGINAL:
-//   - Auth (admin/user login + signup)
-//   - Adsterra smartlinks fetch
-//   - Admin users / links / permissions / assign / unassign
-//   - User stats / analytics
-//   - Goals (CRUD)
-//   - Leaderboard
-//   - Chart data (admin/user)
+// v1.4.0:
+//   - Balance endpoint + withdrawal validation + crypto split + admin fixes
 //
-// v1.3.0:
-//   ✨ SELF-SERVICE LINK CLAIMING
-//   ✨ WITHDRAWAL SYSTEM (with rejection reason)
-//   ✨ LIVE CHAT
-//
-// v1.4.0 (NEW):
-//   💰 BALANCE ENDPOINT — total earned, withdrawn, pending, available
-//   🔒 WITHDRAWAL BALANCE VALIDATION — reject if insufficient funds
-//   🪙 CRYPTO SPLIT — binance_uid (internal) vs usdt_bep20 (on-chain)
-//   🔧 ADMIN WITHDRAWAL FETCH — better error handling + logging
-//   💬 CHAT ENDPOINTS — batch enrichment + robust error handling
+// v1.5.0 (NEW):
+//   🔒 MAX_LINKS_PER_USER — 10 links max per user (transaction-safe)
+//   💰 GET /api/admin/user-balance/:uid — admin on-demand balance + per-link breakdown
+//   📊 available-links returns claimedCount / maxLinks / canClaimMore
+//   🚀 Parallel Adsterra stats fetching (Promise.all) for faster admin balance
 // ============================================
 
 const express = require('express');
@@ -40,7 +28,8 @@ const {
     ADSTERRA_API_KEY,
     ADSTERRA_BASE_URL,
     JWT_SECRET,
-    BALANCE_LOOKBACK_DAYS, // OPTIONAL — defaults to 365
+    BALANCE_LOOKBACK_DAYS,
+    MAX_LINKS_PER_USER,
 } = process.env;
 
 console.log('✅ Environment loaded:');
@@ -49,6 +38,7 @@ console.log(`  ADSTERRA_API_KEY: ${ADSTERRA_API_KEY ? '✅ Set' : '❌ MISSING'}
 console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/'}`);
 console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
 console.log(`  BALANCE_LOOKBACK_DAYS: ${BALANCE_LOOKBACK_DAYS || '365 (default)'}`);
+console.log(`  MAX_LINKS_PER_USER: ${MAX_LINKS_PER_USER || '10 (default)'}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
     console.error('❌ Missing required environment variables. Exiting.');
@@ -56,6 +46,7 @@ if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !
 }
 
 const BALANCE_PERIOD_DAYS = parseInt(BALANCE_LOOKBACK_DAYS) || 365;
+const MAX_LINKS = parseInt(MAX_LINKS_PER_USER) || 10;
 
 // -----------------------------
 // 2. FIREBASE ADMIN SDK INIT
@@ -77,7 +68,7 @@ try {
 }
 
 // -----------------------------
-// 3. EXPRESS APP SETUP (CORS)
+// 3. EXPRESS APP SETUP
 // -----------------------------
 const app = express();
 
@@ -91,9 +82,8 @@ const allowedOrigins = [
 const corsOptions = {
     origin: function (origin, callback) {
         if (!origin) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            callback(null, true);
-        } else {
+        if (allowedOrigins.indexOf(origin) !== -1) callback(null, true);
+        else {
             console.warn('Blocked by CORS:', origin);
             callback(new Error('Not allowed by CORS'));
         }
@@ -126,10 +116,7 @@ app.get('/api/test-adsterra', async (req, res) => {
 
         console.log('🔄 Testing Adsterra API with X-API-Key header:', url);
         const response = await axios.get(url, {
-            headers: {
-                'X-API-Key': ADSTERRA_API_KEY,
-                'Accept': 'application/json'
-            },
+            headers: { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' },
             timeout: 15000,
         });
 
@@ -140,10 +127,7 @@ app.get('/api/test-adsterra', async (req, res) => {
 
         const sample = items.slice(0, 5).map(i => ({
             id: i.id || i.smart_link_id || i.placement_id,
-            title: i.title,
-            alias: i.alias,
-            url: i.url,
-            allKeys: Object.keys(i),
+            title: i.title, alias: i.alias, url: i.url, allKeys: Object.keys(i),
         }));
 
         res.json({ success: true, count: items.length, sample, fullData: response.data });
@@ -181,7 +165,7 @@ const authMiddleware = (requiredRole = null) => {
 };
 
 // -----------------------------
-// 5. FIREBASE REST API HELPER
+// 5. FIREBASE REST HELPER
 // -----------------------------
 const firebaseAuth = async (email, password) => {
     const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
@@ -190,7 +174,7 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. SHARED UTILITY HELPERS
+// 6. SHARED UTILITIES
 // -----------------------------
 const safeDateToISO = (ts) => ts ? ts.toDate().toISOString() : null;
 const getLimit = (req, def = 100, max = 500) => {
@@ -228,8 +212,7 @@ const fetchSmartlinksFromAdsterra = async () => {
             if (!name) {
                 for (const key of Object.keys(item)) {
                     if (key.toLowerCase().includes('name') && typeof item[key] === 'string') {
-                        name = item[key];
-                        break;
+                        name = item[key]; break;
                     }
                 }
             }
@@ -242,7 +225,7 @@ const fetchSmartlinksFromAdsterra = async () => {
             };
         });
 
-        console.log(`✅ Fetched ${mapped.length} smartlinks with names and URLs`);
+        console.log(`✅ Fetched ${mapped.length} smartlinks`);
         return mapped;
     } catch (error) {
         console.error('❌ Adsterra API error:', error.response?.data || error.message);
@@ -386,6 +369,7 @@ app.post('/api/auth/user-signup', async (req, res) => {
             permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
             smartlinkId: null,
             currencyPreference: 'USD',
+            linkCount: 0,
         });
 
         res.status(201).json({
@@ -435,10 +419,7 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
         res.json(smartlinks);
     } catch (error) {
         console.error('Smartlinks fetch error:', error.message);
-        res.status(500).json({
-            message: 'Failed to fetch real data from Adsterra',
-            error: error.message,
-        });
+        res.status(500).json({ message: 'Failed to fetch real data from Adsterra', error: error.message });
     }
 });
 
@@ -466,6 +447,8 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
                 smartlinkId: data.smartlinkId || null,
                 smartlinkName: smartlinkNames.length > 0 ? smartlinkNames.join(', ') : null,
                 assignedLinks: smartlinkNames,
+                linkCount: smartlinkNames.length, // NEW v1.5.0
+                maxLinks: MAX_LINKS,               // NEW v1.5.0
                 currencyPreference: data.currencyPreference || 'USD',
             });
         }
@@ -506,6 +489,7 @@ app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
             permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
             smartlinkId: null,
             currencyPreference: 'USD',
+            linkCount: 0,
         });
 
         res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
@@ -544,6 +528,7 @@ app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) =>
     }
 });
 
+// Admin manual assignment — NO limit check here (admin can override user's 10-link limit)
 app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
     try {
         const { email, smartlinkId } = req.body;
@@ -636,7 +621,6 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
 
 app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
     try {
-        console.log('🔄 Starting name fix for all assignments...');
         const adsterraLinks = await fetchSmartlinksFromAdsterra();
         const nameMap = {};
         adsterraLinks.forEach(link => { nameMap[link.id] = link.name; });
@@ -671,27 +655,50 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
 });
 
 // ================================================================
-// 10. USER — AVAILABLE LINKS + CLAIM
+// 10. USER — AVAILABLE LINKS + CLAIM (v1.5.0: 10-link limit)
 // ================================================================
+
+/**
+ * GET /api/user/available-links
+ * Returns: available links pool + user's claimed count + limit info.
+ */
 app.get('/api/user/available-links', authMiddleware('user'), async (req, res) => {
     try {
+        const uid = req.user.uid;
         const adsterraLinks = await fetchSmartlinksFromAdsterra();
 
+        // All currently claimed links (from ALL users)
         const assignmentsSnapshot = await db.collection('assignments').get();
         const claimedIds = new Set();
         assignmentsSnapshot.forEach(doc => claimedIds.add(doc.data().smartlinkId));
+
+        // This user's current claimed links
+        const userAssignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+        const claimedCount = userAssignmentsSnapshot.size;
+        const canClaimMore = claimedCount < MAX_LINKS;
 
         const available = adsterraLinks
             .filter(link => !claimedIds.has(String(link.id)))
             .map(link => ({ id: link.id, name: link.name, url: link.url }));
 
-        res.json({ links: available, count: available.length });
+        res.json({
+            links: available,
+            count: available.length,
+            claimedCount,                                          // NEW v1.5.0
+            maxLinks: MAX_LINKS,                                   // NEW v1.5.0
+            canClaimMore,                                          // NEW v1.5.0
+            remaining: Math.max(0, MAX_LINKS - claimedCount),      // NEW v1.5.0
+        });
     } catch (error) {
         console.error('Available links error:', error);
         res.status(500).json({ message: 'Failed to fetch available links', error: error.message });
     }
 });
 
+/**
+ * POST /api/user/claim-link
+ * Transaction-safe claim with 10-link limit enforcement.
+ */
 app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -705,15 +712,25 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
         if (!link) return res.status(404).json({ message: 'Link not found in Adsterra pool.' });
 
         await db.runTransaction(async (transaction) => {
+            // 1. Count user's current assignments INSIDE transaction (prevents race)
+            const userAssignmentsQuery = db.collection('assignments').where('userId', '==', uid);
+            const userAssignmentsSnapshot = await transaction.get(userAssignmentsQuery);
+
+            if (userAssignmentsSnapshot.size >= MAX_LINKS) {
+                throw new Error('MAX_LINKS_REACHED');
+            }
+
+            // 2. Check if link is already claimed
             const assignmentRef = db.collection('assignments').doc(String(smartlinkId));
-            const userRef = db.collection('users').doc(uid);
-
             const assignmentDoc = await transaction.get(assignmentRef);
-            const userDoc = await transaction.get(userRef);
-
             if (assignmentDoc.exists) throw new Error('ALREADY_CLAIMED');
+
+            // 3. Verify user exists
+            const userRef = db.collection('users').doc(uid);
+            const userDoc = await transaction.get(userRef);
             if (!userDoc.exists) throw new Error('USER_NOT_FOUND');
 
+            // 4. Write
             transaction.set(assignmentRef, {
                 userId: uid,
                 userEmail: email,
@@ -725,11 +742,25 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
             transaction.update(userRef, { smartlinkId: String(smartlinkId) });
         });
 
+        // Get updated count for response
+        const finalSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+        const finalCount = finalSnapshot.size;
+
         res.json({
             message: `Link "${link.name}" claimed successfully!`,
             link: { id: link.id, name: link.name, url: link.url },
+            claimedCount: finalCount,
+            maxLinks: MAX_LINKS,
+            remaining: Math.max(0, MAX_LINKS - finalCount),
         });
     } catch (error) {
+        if (error.message === 'MAX_LINKS_REACHED') {
+            return res.status(403).json({
+                message: `You've reached the maximum limit of ${MAX_LINKS} links per user. Contact admin if you need more.`,
+                maxLinks: MAX_LINKS,
+                canClaimMore: false,
+            });
+        }
         if (error.message === 'ALREADY_CLAIMED') {
             return res.status(409).json({ message: 'This link has already been claimed by another user.' });
         }
@@ -769,7 +800,7 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
                     const metrics = mapStatsToMetrics(rawStats);
                     smartlinks.push({ id: smartlinkId, name: smartlinkName, metrics });
                 } catch (error) {
-                    console.warn(`⚠️ Failed to fetch stats for link ${smartlinkId}:`, error.message);
+                    console.warn(`⚠️ Failed stats for link ${smartlinkId}:`, error.message);
                     smartlinks.push({
                         id: smartlinkId,
                         name: smartlinkName,
@@ -779,7 +810,13 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
             }
         }
 
-        res.json({ userEmail: userData.email, permissions, smartlinks });
+        res.json({
+            userEmail: userData.email,
+            permissions,
+            smartlinks,
+            linkCount: smartlinks.length,
+            maxLinks: MAX_LINKS,
+        });
     } catch (error) {
         console.error('User stats error:', error);
         res.status(500).json({ message: 'Failed to fetch user statistics' });
@@ -813,12 +850,11 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             if (!assignmentsSnapshot.empty) {
                 for (const doc of assignmentsSnapshot.docs) {
                     const assignmentData = doc.data();
-                    const smartlinkId = assignmentData.smartlinkId;
                     try {
-                        const rawStats = await fetchStatsFromAdsterra(today, tomorrow, smartlinkId);
+                        const rawStats = await fetchStatsFromAdsterra(today, tomorrow, assignmentData.smartlinkId);
                         totalClicks += rawStats.clicks || 0;
                     } catch (error) {
-                        console.warn(`⚠️ Analytics stats failed for link ${smartlinkId}:`, error.message);
+                        console.warn(`⚠️ Analytics stats failed for link ${assignmentData.smartlinkId}:`, error.message);
                     }
                 }
             }
@@ -847,9 +883,8 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo) => {
 
     for (const doc of assignmentsSnapshot.docs) {
         const data = doc.data();
-        const smartlinkId = data.smartlinkId;
         try {
-            const rawStats = await fetchStatsFromAdsterra(dateFrom, dateTo, smartlinkId);
+            const rawStats = await fetchStatsFromAdsterra(dateFrom, dateTo, data.smartlinkId);
             totalImpressions += rawStats.impressions || 0;
             totalClicks += rawStats.clicks || 0;
             totalRevenue += rawStats.revenue || 0;
@@ -857,7 +892,7 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo) => {
             totalRpm += rawStats.rpm || 0;
             count++;
         } catch (error) {
-            console.warn(`⚠️ Goal agg stats failed for link ${smartlinkId}:`, error.message);
+            console.warn(`⚠️ Goal agg stats failed for link ${data.smartlinkId}:`, error.message);
         }
     }
 
@@ -990,30 +1025,18 @@ app.delete('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) =
 });
 
 // ================================================================
-// 13. NEW (v1.4.0): USER BALANCE
+// 13. USER BALANCE
 // ================================================================
-
-/**
- * Core balance calculation helper.
- * Balance = TotalEarned - ApprovedWithdrawn - PendingWithdrawn - ProcessingWithdrawn
- */
 const getUserBalance = async (uid, days = BALANCE_PERIOD_DAYS) => {
     const today = new Date().toISOString().split('T')[0];
     const fromDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-    // Total earned (revenue from all assigned links)
     const stats = await getUserAggregatedStats(uid, fromDate, today);
     const totalEarned = stats.revenue || 0;
 
-    // Total withdrawals (all statuses)
-    const withdrawalsSnapshot = await db.collection('withdrawalRequests')
-        .where('userId', '==', uid)
-        .get();
+    const withdrawalsSnapshot = await db.collection('withdrawalRequests').where('userId', '==', uid).get();
 
-    let totalWithdrawn = 0;      // approved (money already sent)
-    let totalPending = 0;        // pending (waiting for admin)
-    let totalProcessing = 0;     // processing (admin approved, sending money)
-
+    let totalWithdrawn = 0, totalPending = 0, totalProcessing = 0;
     withdrawalsSnapshot.forEach(doc => {
         const d = doc.data();
         const amt = parseFloat(d.amount) || 0;
@@ -1040,15 +1063,10 @@ const getUserBalance = async (uid, days = BALANCE_PERIOD_DAYS) => {
     };
 };
 
-/**
- * GET /api/user/balance
- * Returns user's current balance breakdown.
- */
 app.get('/api/user/balance', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
         const days = parseInt(req.query.days) || BALANCE_PERIOD_DAYS;
-
         const balance = await getUserBalance(uid, days);
         res.json(balance);
     } catch (error) {
@@ -1061,13 +1079,149 @@ app.get('/api/user/balance', authMiddleware('user'), async (req, res) => {
 });
 
 // ================================================================
-// 14. USER — WITHDRAWAL REQUESTS (with balance validation)
+// 13B. NEW v1.5.0: ADMIN — USER BALANCE WITH PER-LINK BREAKDOWN
 // ================================================================
 
-// Crypto methods are SPLIT now:
-//   - binance_uid  → internal transfer, needs UID only
-//   - usdt_bep20   → on-chain transfer, needs wallet address only
-// Legacy 'crypto' method kept for OLD database records only (validation still handles it).
+/**
+ * Full balance + per-link revenue breakdown for a specific user.
+ * Uses PARALLEL Adsterra calls for speed.
+ */
+const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
+    const today = new Date().toISOString().split('T')[0];
+    const fromDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    // Get user's assignments
+    const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+
+    // Fetch per-link stats IN PARALLEL
+    const linkPromises = [];
+    assignmentsSnapshot.forEach(doc => {
+        const data = doc.data();
+        linkPromises.push(
+            (async () => {
+                try {
+                    const rawStats = await fetchStatsFromAdsterra(fromDate, today, data.smartlinkId);
+                    const metrics = mapStatsToMetrics(rawStats);
+                    return {
+                        id: data.smartlinkId,
+                        name: data.smartlinkName || data.smartlinkId,
+                        revenue: metrics.revenue,
+                        clicks: metrics.clicks,
+                        impressions: metrics.impressions,
+                        cpm: metrics.cpm,
+                        rpm: metrics.rpm,
+                        claimedBySelf: data.claimedBySelf || false,
+                        assignedAt: safeDateToISO(data.assignedAt),
+                        error: false,
+                    };
+                } catch (err) {
+                    console.warn(`⚠️ Failed stats for link ${data.smartlinkId}:`, err.message);
+                    return {
+                        id: data.smartlinkId,
+                        name: data.smartlinkName || data.smartlinkId,
+                        revenue: 0, clicks: 0, impressions: 0, cpm: 0, rpm: 0,
+                        claimedBySelf: data.claimedBySelf || false,
+                        assignedAt: safeDateToISO(data.assignedAt),
+                        error: true,
+                    };
+                }
+            })()
+        );
+    });
+
+    const links = await Promise.all(linkPromises);
+    links.sort((a, b) => (b.revenue || 0) - (a.revenue || 0));
+
+    const totalEarned = links.reduce((sum, l) => sum + (l.revenue || 0), 0);
+
+    // Withdrawals
+    const withdrawalsSnapshot = await db.collection('withdrawalRequests').where('userId', '==', uid).get();
+    let totalWithdrawn = 0, totalPending = 0, totalProcessing = 0;
+    withdrawalsSnapshot.forEach(doc => {
+        const d = doc.data();
+        const amt = parseFloat(d.amount) || 0;
+        if (d.status === 'approved') totalWithdrawn += amt;
+        else if (d.status === 'pending') totalPending += amt;
+        else if (d.status === 'processing') totalProcessing += amt;
+    });
+
+    const lockedInRequests = totalPending + totalProcessing;
+    const availableBalance = Math.max(0, totalEarned - totalWithdrawn - lockedInRequests);
+
+    return {
+        availableBalance: Math.round(availableBalance * 100) / 100,
+        totalEarned: Math.round(totalEarned * 100) / 100,
+        totalWithdrawn: Math.round(totalWithdrawn * 100) / 100,
+        totalPending: Math.round(totalPending * 100) / 100,
+        totalProcessing: Math.round(totalProcessing * 100) / 100,
+        lockedInRequests: Math.round(lockedInRequests * 100) / 100,
+        currency: 'USD',
+        periodDays: days,
+        periodFrom: fromDate,
+        periodTo: today,
+        calculatedAt: new Date().toISOString(),
+        links,
+        linksCount: links.length,
+    };
+};
+
+/**
+ * GET /api/admin/user-balance/:uid
+ * Admin-only: full balance breakdown + per-link revenue for a specific user.
+ */
+app.get('/api/admin/user-balance/:uid', authMiddleware('admin'), async (req, res) => {
+    try {
+        const { uid } = req.params;
+        if (!uid) return res.status(400).json({ message: 'User ID required.' });
+
+        const userDoc = await db.collection('users').doc(uid).get();
+        if (!userDoc.exists) return res.status(404).json({ message: 'User not found.' });
+
+        const userData = userDoc.data();
+        const days = parseInt(req.query.days) || BALANCE_PERIOD_DAYS;
+
+        console.log(`🔄 [ADMIN BALANCE] Fetching for uid=${uid}, days=${days}`);
+        const breakdown = await getUserBalanceWithBreakdown(uid, days);
+        console.log(`✅ [ADMIN BALANCE] Done. ${breakdown.linksCount} links, available=$${breakdown.availableBalance}`);
+
+        res.json({
+            user: {
+                uid,
+                email: userData.email,
+                displayName: userData.displayName || (userData.email || '').split('@')[0] || 'User',
+                role: userData.role,
+                createdAt: safeDateToISO(userData.createdAt),
+            },
+            balance: {
+                availableBalance: breakdown.availableBalance,
+                totalEarned: breakdown.totalEarned,
+                totalWithdrawn: breakdown.totalWithdrawn,
+                totalPending: breakdown.totalPending,
+                totalProcessing: breakdown.totalProcessing,
+                lockedInRequests: breakdown.lockedInRequests,
+                currency: breakdown.currency,
+                periodDays: breakdown.periodDays,
+                periodFrom: breakdown.periodFrom,
+                periodTo: breakdown.periodTo,
+                calculatedAt: breakdown.calculatedAt,
+            },
+            links: breakdown.links,
+            linksCount: breakdown.linksCount,
+            maxLinks: MAX_LINKS,
+            canClaimMore: breakdown.linksCount < MAX_LINKS,
+        });
+    } catch (error) {
+        console.error('❌ Admin user balance error:', error);
+        res.status(500).json({
+            message: 'Failed to fetch user balance',
+            error: error.message,
+        });
+    }
+});
+
+// ================================================================
+// 14. USER — WITHDRAWAL REQUESTS (balance validated)
+// ================================================================
 const WITHDRAWAL_METHODS = ['jazzcash', 'easypaisa', 'bank', 'binance_uid', 'usdt_bep20'];
 const MIN_WITHDRAWAL_USD = 1;
 
@@ -1102,16 +1256,13 @@ app.post('/api/user/withdrawal-request', authMiddleware('user'), async (req, res
         const uid = req.user.uid;
         const email = req.user.email;
 
-        // 1. Validate payload
         const validationError = validateWithdrawalPayload(req.body);
         if (validationError) return res.status(400).json({ message: validationError });
 
-        // 2. Fetch user
         const userDoc = await db.collection('users').doc(uid).get();
         if (!userDoc.exists) return res.status(404).json({ message: 'User not found.' });
         const userData = userDoc.data();
 
-        // 3. Balance check (CRITICAL FIX)
         const requestedAmount = parseFloat(req.body.amount);
         let balance;
         try {
@@ -1156,10 +1307,9 @@ app.post('/api/user/withdrawal-request', authMiddleware('user'), async (req, res
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             processedBy: null,
             processedAt: null,
-            balanceAtRequest: balance.availableBalance, // audit trail
+            balanceAtRequest: balance.availableBalance,
         };
 
-        // Method-specific fields
         if (method === 'jazzcash' || method === 'easypaisa') {
             requestData.accountName = String(accountName).trim();
             requestData.accountNumber = String(accountNumber).trim();
@@ -1195,9 +1345,7 @@ app.get('/api/user/withdrawal-requests', authMiddleware('user'), async (req, res
         const uid = req.user.uid;
         const limit = getLimit(req, 100, 200);
 
-        const snapshot = await db.collection('withdrawalRequests')
-            .where('userId', '==', uid)
-            .get();
+        const snapshot = await db.collection('withdrawalRequests').where('userId', '==', uid).get();
 
         const requests = [];
         snapshot.forEach(doc => {
@@ -1237,12 +1385,8 @@ app.get('/api/user/withdrawal-requests', authMiddleware('user'), async (req, res
 });
 
 // ================================================================
-// 15. ADMIN — WITHDRAWAL MANAGEMENT (v1.4.0 improved)
+// 15. ADMIN — WITHDRAWAL MANAGEMENT
 // ================================================================
-
-/**
- * GET /api/admin/withdrawal-requests?status=pending|processing|approved|rejected|all
- */
 app.get('/api/admin/withdrawal-requests', authMiddleware('admin'), async (req, res) => {
     try {
         const status = req.query.status || 'all';
@@ -1250,7 +1394,6 @@ app.get('/api/admin/withdrawal-requests', authMiddleware('admin'), async (req, r
 
         console.log(`🔄 [ADMIN WITHDRAWALS] Fetching. Status filter: ${status}`);
 
-        // Fetch ALL, filter in memory to avoid missing index / query issues
         const snapshot = await db.collection('withdrawalRequests').get();
 
         const requests = [];
@@ -1280,19 +1423,15 @@ app.get('/api/admin/withdrawal-requests', authMiddleware('admin'), async (req, r
             });
         });
 
-        // Filter by status (in memory)
-        const filtered = status === 'all'
-            ? requests
-            : requests.filter(r => r.status === status);
+        const filtered = status === 'all' ? requests : requests.filter(r => r.status === status);
 
-        // Sort newest first
         filtered.sort((a, b) => {
             const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
             const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
             return bt - at;
         });
 
-        console.log(`✅ [ADMIN WITHDRAWALS] Returning ${filtered.length} of ${requests.length} total (filter=${status})`);
+        console.log(`✅ [ADMIN WITHDRAWALS] Returning ${filtered.length}/${requests.length} (filter=${status})`);
 
         res.json({
             requests: filtered.slice(0, limit),
@@ -1302,18 +1441,10 @@ app.get('/api/admin/withdrawal-requests', authMiddleware('admin'), async (req, r
         });
     } catch (error) {
         console.error('❌ [ADMIN WITHDRAWALS] Fetch error:', error);
-        res.status(500).json({
-            message: 'Failed to fetch withdrawal requests',
-            error: error.message,
-        });
+        res.status(500).json({ message: 'Failed to fetch withdrawal requests', error: error.message });
     }
 });
 
-/**
- * PATCH /api/admin/withdrawal-requests/:id
- * Body: { status, rejectionReason? }
- * rejectionReason REQUIRED when status = 'rejected'
- */
 app.patch('/api/admin/withdrawal-requests/:id', authMiddleware('admin'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -1362,9 +1493,7 @@ app.get('/api/user/chat/messages', authMiddleware('user'), async (req, res) => {
         const userEmail = req.user.email;
         const limit = getLimit(req, 100, 300);
 
-        const snapshot = await db.collection('chatMessages')
-            .where('userEmail', '==', userEmail)
-            .get();
+        const snapshot = await db.collection('chatMessages').where('userEmail', '==', userEmail).get();
 
         const messages = [];
         snapshot.forEach(doc => {
@@ -1443,13 +1572,8 @@ app.patch('/api/user/chat/read', authMiddleware('user'), async (req, res) => {
 });
 
 // ================================================================
-// 17. ADMIN — LIVE CHAT (v1.4.0 improved — batch enrichment)
+// 17. ADMIN — LIVE CHAT
 // ================================================================
-
-/**
- * GET /api/admin/chat/users
- * Returns list of users with chat threads (with unread count + last message).
- */
 app.get('/api/admin/chat/users', authMiddleware('admin'), async (req, res) => {
     try {
         console.log('🔄 [ADMIN CHAT] Fetching chat threads...');
@@ -1489,7 +1613,7 @@ app.get('/api/admin/chat/users', authMiddleware('admin'), async (req, res) => {
             }
         });
 
-        // Enrich with display names — batch of 10 (Firestore 'in' limit)
+        // Enrich with display names — batch of 10
         const emails = Object.keys(threadsMap);
         if (emails.length > 0) {
             const chunkSize = 10;
@@ -1504,20 +1628,16 @@ app.get('/api/admin/chat/users', authMiddleware('admin'), async (req, res) => {
                         }
                     });
                 } catch (enrichErr) {
-                    console.warn('⚠️ User enrichment chunk failed (continuing):', enrichErr.message);
+                    console.warn('⚠️ Enrichment chunk failed:', enrichErr.message);
                 }
             }
         }
 
         const threads = Object.values(threadsMap).sort((a, b) => b.lastMessageAt - a.lastMessageAt);
 
-        console.log(`✅ [ADMIN CHAT] ${threads.length} threads, ${totalUnread} unread total`);
+        console.log(`✅ [ADMIN CHAT] ${threads.length} threads, ${totalUnread} unread`);
 
-        res.json({
-            threads,
-            totalUnread,
-            totalThreads: threads.length,
-        });
+        res.json({ threads, totalUnread, totalThreads: threads.length });
     } catch (error) {
         console.error('❌ [ADMIN CHAT] Fetch threads error:', error);
         res.status(500).json({ message: 'Failed to fetch chat threads', error: error.message });
@@ -1530,9 +1650,7 @@ app.get('/api/admin/chat/messages/:userEmail', authMiddleware('admin'), async (r
         if (!userEmail) return res.status(400).json({ message: 'User email required.' });
         const limit = getLimit(req, 100, 300);
 
-        const snapshot = await db.collection('chatMessages')
-            .where('userEmail', '==', userEmail)
-            .get();
+        const snapshot = await db.collection('chatMessages').where('userEmail', '==', userEmail).get();
 
         const messages = [];
         snapshot.forEach(doc => {
@@ -1668,12 +1786,7 @@ app.get('/api/leaderboard', authMiddleware('user'), async (req, res) => {
         leaderboardData.sort((a, b) => b.revenue - a.revenue);
         const topUsers = leaderboardData.slice(0, 20);
 
-        res.json({
-            period,
-            from: fromStr,
-            to: todayStr,
-            users: topUsers,
-        });
+        res.json({ period, from: fromStr, to: todayStr, users: topUsers });
     } catch (error) {
         console.error('Leaderboard error:', error);
         res.status(500).json({ message: 'Failed to fetch leaderboard', error: error.message });
@@ -1704,7 +1817,7 @@ const aggregateDailyStats = async (linkIds, days) => {
                 }
             });
         } catch (err) {
-            console.warn(`Failed to fetch daily stats for link ${linkId}:`, err.message);
+            console.warn(`Failed daily stats for link ${linkId}:`, err.message);
         }
     }
 
@@ -1768,7 +1881,7 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
 app.get('/api', (req, res) => {
     res.json({
         name: 'Lunar Metrics API',
-        version: '1.4.0',
+        version: '1.5.0',
         status: 'operational',
         features: [
             'auth',
@@ -1781,12 +1894,19 @@ app.get('/api', (req, res) => {
             'leaderboard',
             'chart-data',
             'self-service-claiming',
+            'claim-limit-10',                 // NEW v1.5.0
             'withdrawals',
             'live-chat',
-            'balance',              // NEW v1.4.0
-            'balance-validated-withdrawals', // NEW v1.4.0
-            'crypto-split-methods', // NEW v1.4.0
+            'balance',
+            'balance-validated-withdrawals',
+            'crypto-split-methods',
+            'admin-user-balance-breakdown',   // NEW v1.5.0
         ],
+        limits: {
+            maxLinksPerUser: MAX_LINKS,
+            balanceLookbackDays: BALANCE_PERIOD_DAYS,
+            minWithdrawalUsd: MIN_WITHDRAWAL_USD,
+        },
         timestamp: new Date().toISOString(),
     });
 });
