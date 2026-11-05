@@ -1,7 +1,19 @@
 // ============================================
-// LUNAR METRICS · MASTER BACKEND
-// Real Smartlink Names (alias) + URL + Signup + Analytics + Charts + Compare + Search
-// + Goals + Leaderboard + Multi-Currency (USD/PKR)
+// LUNAR METRICS · MASTER BACKEND (v1.3.0)
+// ============================================
+// ORIGINAL:
+//   - Auth (admin/user login + signup)
+//   - Adsterra smartlinks fetch
+//   - Admin users / links / permissions / assign / unassign
+//   - User stats / analytics
+//   - Goals (CRUD)
+//   - Leaderboard
+//   - Chart data (admin/user)
+//
+// NEW IN v1.3.0:
+//   ✨ SELF-SERVICE LINK CLAIMING (available links + atomic claim)
+//   ✨ WITHDRAWAL SYSTEM (user requests + admin approve/reject/processing + rejection reason)
+//   ✨ LIVE CHAT (user ↔ admin, polling-based, with unread counts)
 // ============================================
 
 const express = require('express');
@@ -98,11 +110,9 @@ app.get('/api/test', (req, res) => {
 app.get('/api/test-adsterra', async (req, res) => {
     try {
         let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
-        if (!baseUrl.endsWith('/')) {
-            baseUrl += '/';
-        }
+        if (!baseUrl.endsWith('/')) baseUrl += '/';
         const url = `${baseUrl}smart-links.json`;
-        
+
         console.log('🔄 Testing Adsterra API with X-API-Key header:', url);
         const response = await axios.get(url, {
             headers: {
@@ -111,15 +121,11 @@ app.get('/api/test-adsterra', async (req, res) => {
             },
             timeout: 15000,
         });
-        
+
         let items = [];
-        if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
-            items = response.data.data.items;
-        } else if (response.data && Array.isArray(response.data)) {
-            items = response.data;
-        } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
-            items = response.data.items;
-        }
+        if (response.data?.data?.items && Array.isArray(response.data.data.items)) items = response.data.data.items;
+        else if (Array.isArray(response.data)) items = response.data;
+        else if (response.data?.items && Array.isArray(response.data.items)) items = response.data.items;
 
         const sample = items.slice(0, 5).map(i => ({
             id: i.id || i.smart_link_id || i.placement_id,
@@ -132,7 +138,7 @@ app.get('/api/test-adsterra', async (req, res) => {
         res.json({
             success: true,
             count: items.length,
-            sample: sample,
+            sample,
             fullData: response.data,
         });
     } catch (error) {
@@ -153,11 +159,11 @@ const authMiddleware = (requiredRole = null) => {
     return async (req, res, next) => {
         try {
             const token = req.headers.authorization?.split('Bearer ')[1];
-            if (!token) {
-                return res.status(401).json({ message: 'Unauthorized: No token provided' });
-            }
+            if (!token) return res.status(401).json({ message: 'Unauthorized: No token provided' });
+
             const decoded = jwt.verify(token, JWT_SECRET);
             req.user = decoded;
+
             if (requiredRole && decoded.role !== requiredRole) {
                 return res.status(403).json({ message: 'Forbidden: Insufficient permissions' });
             }
@@ -178,17 +184,22 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA API HELPERS
+// 6. SHARED UTILITY HELPERS
+// -----------------------------
+const safeDateToISO = (ts) => ts ? ts.toDate().toISOString() : null;
+
+const getLimit = (req, def = 100, max = 500) => {
+    const n = parseInt(req.query.limit) || def;
+    return Math.min(Math.max(n, 1), max);
+};
+
+// -----------------------------
+// 7. ADSTERRA API HELPERS
 // -----------------------------
 
-/**
- * Fetch ALL Smartlinks from Adsterra with REAL names (alias) AND URL
- */
 const fetchSmartlinksFromAdsterra = async () => {
     let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
-    if (!baseUrl.endsWith('/')) {
-        baseUrl += '/';
-    }
+    if (!baseUrl.endsWith('/')) baseUrl += '/';
     const url = `${baseUrl}smart-links.json`;
 
     console.log(`🔄 Fetching real smartlinks from: ${url} using X-API-Key`);
@@ -202,30 +213,17 @@ const fetchSmartlinksFromAdsterra = async () => {
             timeout: 15000,
         });
 
-        if (response.status !== 200) {
-            throw new Error(`Adsterra returned status ${response.status}`);
-        }
+        if (response.status !== 200) throw new Error(`Adsterra returned status ${response.status}`);
 
         let items = [];
-        if (response.data && response.data.data && Array.isArray(response.data.data.items)) {
-            items = response.data.data.items;
-        } else if (response.data && Array.isArray(response.data)) {
-            items = response.data;
-        } else if (response.data && response.data.items && Array.isArray(response.data.items)) {
-            items = response.data.items;
-        } else if (response.data && response.data.result && Array.isArray(response.data.result)) {
-            items = response.data.result;
-        } else {
-            throw new Error('Unexpected response structure from Adsterra');
-        }
-
-        if (items.length === 0) {
-            console.warn('⚠️ Adsterra returned 0 smartlinks');
-        }
+        if (response.data?.data?.items && Array.isArray(response.data.data.items)) items = response.data.data.items;
+        else if (Array.isArray(response.data)) items = response.data;
+        else if (response.data?.items && Array.isArray(response.data.items)) items = response.data.items;
+        else if (response.data?.result && Array.isArray(response.data.result)) items = response.data.result;
+        else throw new Error('Unexpected response structure from Adsterra');
 
         const mapped = items.map(item => {
             let name = item.alias || item.name || item.title || item.label || item.smartlink_name || '';
-            
             if (!name) {
                 for (const key of Object.keys(item)) {
                     if (key.toLowerCase().includes('name') && typeof item[key] === 'string') {
@@ -234,23 +232,16 @@ const fetchSmartlinksFromAdsterra = async () => {
                     }
                 }
             }
-            
-            if (!name) {
-                name = item.id || item.smart_link_id || item.placement_id || 'Unnamed';
-            }
+            if (!name) name = item.id || item.smart_link_id || item.placement_id || 'Unnamed';
 
             return {
-                id: item.id || item.smart_link_id || item.placement_id || String(item),
-                name: name,
+                id: String(item.id || item.smart_link_id || item.placement_id || item),
+                name,
                 url: item.url || '',
             };
         });
 
         console.log(`✅ Fetched ${mapped.length} smartlinks with names and URLs`);
-        mapped.slice(0, 3).forEach((link, i) => {
-            console.log(`  ${i+1}. ${link.id} → ${link.name} → ${link.url ? '✅ URL' : '❌ No URL'}`);
-        });
-
         return mapped;
     } catch (error) {
         console.error('❌ Adsterra API error:', error.response?.data || error.message);
@@ -258,38 +249,24 @@ const fetchSmartlinksFromAdsterra = async () => {
     }
 };
 
-/**
- * Fetch statistics for a specific smartlink for a given date range (aggregated)
- */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     try {
         let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
-        if (!baseUrl.endsWith('/')) {
-            baseUrl += '/';
-        }
+        if (!baseUrl.endsWith('/')) baseUrl += '/';
         const url = `${baseUrl}stats.json`;
 
-        const params = {
-            from: dateFrom,
-            to: dateTo,
-        };
-        if (smartlinkId) {
-            params.placement_id = smartlinkId;
-        }
+        const params = { from: dateFrom, to: dateTo };
+        if (smartlinkId) params.placement_id = smartlinkId;
 
         const response = await axios.get(url, {
-            params: params,
-            headers: {
-                'X-API-Key': ADSTERRA_API_KEY,
-                'Accept': 'application/json'
-            },
+            params,
+            headers: { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' },
             timeout: 15000,
         });
 
         let statsData = response.data;
-        if (statsData.data && statsData.data.items) {
-            statsData = statsData.data.items;
-        }
+        if (statsData.data?.items) statsData = statsData.data.items;
+
         if (Array.isArray(statsData)) {
             if (smartlinkId) {
                 const found = statsData.find(item =>
@@ -307,10 +284,6 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     }
 };
 
-/**
- * NEW: Fetch daily stats for a link over a number of days (real per-day calls)
- * Returns array of { date, impressions, clicks, revenue }
- */
 const fetchDailyStatsForLink = async (smartlinkId, days = 7) => {
     const dailyData = [];
     const now = new Date();
@@ -322,13 +295,12 @@ const fetchDailyStatsForLink = async (smartlinkId, days = 7) => {
         nextDay.setDate(nextDay.getDate() + 1);
         const nextDateStr = nextDay.toISOString().split('T')[0];
 
-        // Fetch stats for this single day
         const stats = await fetchStatsFromAdsterra(dateStr, nextDateStr, smartlinkId);
         dailyData.push({
             date: dateStr,
             impressions: stats.impressions || 0,
             clicks: stats.clicks || 0,
-            revenue: stats.revenue || 0
+            revenue: stats.revenue || 0,
         });
     }
     return dailyData;
@@ -343,9 +315,8 @@ const mapStatsToMetrics = (rawStats) => ({
 });
 
 // -----------------------------
-// 7. AUTH ENDPOINTS (including signup)
+// 8. AUTH ENDPOINTS
 // -----------------------------
-
 app.post('/api/auth/admin-login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -403,27 +374,21 @@ app.post('/api/auth/user-signup', async (req, res) => {
         }
 
         const userRecord = await admin.auth().createUser({
-            email: email,
-            password: password,
+            email,
+            password,
             emailVerified: false,
             disabled: false,
             displayName: name,
         });
 
         await db.collection('users').doc(userRecord.uid).set({
-            email: email,
+            email,
             displayName: name,
             role: 'user',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            permissions: {
-                impressions: true,
-                clicks: true,
-                cpm: true,
-                rpm: true,
-                revenue: true,
-            },
+            permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
             smartlinkId: null,
-            currencyPreference: 'USD', // NEW: default currency
+            currencyPreference: 'USD',
         });
 
         res.status(201).json({
@@ -440,9 +405,8 @@ app.post('/api/auth/user-signup', async (req, res) => {
 });
 
 // -----------------------------
-// 8. ADMIN ENDPOINTS
+// 9. ADMIN ENDPOINTS (Users / Links)
 // -----------------------------
-
 app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
     try {
         const adsterraLinks = await fetchSmartlinksFromAdsterra();
@@ -455,6 +419,7 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
                 userEmail: data.userEmail,
                 userId: data.userId,
                 smartlinkName: data.smartlinkName,
+                claimedBySelf: data.claimedBySelf || false,
             };
         });
 
@@ -465,6 +430,7 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
                 status: assigned ? 'assigned' : 'available',
                 assignedTo: assigned ? assigned.userEmail : null,
                 assignedUserId: assigned ? assigned.userId : null,
+                claimedBySelf: assigned ? assigned.claimedBySelf : false,
                 url: link.url || '',
             };
         });
@@ -479,12 +445,12 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
     }
 });
 
-// UPDATED: /api/admin/users with search and filter support
 app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
     try {
         const { search, filter } = req.query;
-        let usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
+        const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
         let users = [];
+
         for (const doc of usersSnapshot.docs) {
             const data = doc.data();
             const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', doc.id).get();
@@ -503,11 +469,10 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
                 smartlinkId: data.smartlinkId || null,
                 smartlinkName: smartlinkNames.length > 0 ? smartlinkNames.join(', ') : null,
                 assignedLinks: smartlinkNames,
-                currencyPreference: data.currencyPreference || 'USD', // NEW
+                currencyPreference: data.currencyPreference || 'USD',
             });
         }
 
-        // Apply search filter (client-side simulation for now, but we do server-side)
         if (search) {
             const s = search.toLowerCase();
             users = users.filter(u =>
@@ -543,7 +508,7 @@ app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
             smartlinkId: null,
-            currencyPreference: 'USD', // NEW
+            currencyPreference: 'USD',
         });
 
         res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
@@ -561,12 +526,17 @@ app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) =>
 
         await admin.auth().deleteUser(uid);
         await db.collection('users').doc(uid).delete();
+
+        // Delete all assignments → links go back to "available"
         const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
         const batch = db.batch();
         assignmentsSnapshot.forEach(doc => batch.delete(doc.ref));
         await batch.commit();
 
-        res.json({ message: 'User deleted successfully' });
+        // NOTE: We intentionally do NOT delete withdrawalRequests or chatMessages
+        // — kept for audit trail. Admin can still see history.
+
+        res.json({ message: 'User deleted successfully. Their links are now available.' });
     } catch (error) {
         console.error('Delete user error:', error);
         if (error.code === 'auth/user-not-found') {
@@ -591,30 +561,40 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
         const userDoc = userSnapshot.docs[0];
         const uid = userDoc.id;
 
-        const existingAssignment = await db.collection('assignments').doc(smartlinkId).get();
-        if (existingAssignment.exists) return res.status(400).json({ message: 'Smartlink already assigned' });
-
-        let smartlinkName = smartlinkId;
+        // Use transaction to prevent race with self-claim
+        let linkName = smartlinkId;
         try {
             const adsterraLinks = await fetchSmartlinksFromAdsterra();
             const found = adsterraLinks.find(l => l.id == smartlinkId);
-            if (found && found.name) smartlinkName = found.name;
-        } catch (error) {
-            console.warn(`⚠️ Could not fetch name from Adsterra: ${error.message}`);
+            if (found && found.name) linkName = found.name;
+        } catch (err) {
+            console.warn(`⚠️ Could not fetch name from Adsterra: ${err.message}`);
         }
 
-        await db.collection('assignments').doc(smartlinkId).set({
-            userId: uid,
-            userEmail: email,
-            smartlinkId,
-            smartlinkName,
-            assignedAt: admin.firestore.FieldValue.serverTimestamp(),
+        await db.runTransaction(async (transaction) => {
+            const assignmentRef = db.collection('assignments').doc(String(smartlinkId));
+            const assignmentDoc = await transaction.get(assignmentRef);
+            if (assignmentDoc.exists) {
+                throw new Error('ALREADY_ASSIGNED');
+            }
+
+            transaction.set(assignmentRef, {
+                userId: uid,
+                userEmail: email,
+                smartlinkId: String(smartlinkId),
+                smartlinkName: linkName,
+                assignedAt: admin.firestore.FieldValue.serverTimestamp(),
+                claimedBySelf: false,
+            });
+
+            transaction.update(db.collection('users').doc(uid), { smartlinkId: String(smartlinkId) });
         });
 
-        await db.collection('users').doc(uid).update({ smartlinkId });
-
-        res.json({ message: `Link "${smartlinkName}" assigned successfully` });
+        res.json({ message: `Link "${linkName}" assigned successfully` });
     } catch (error) {
+        if (error.message === 'ALREADY_ASSIGNED') {
+            return res.status(400).json({ message: 'Smartlink already assigned' });
+        }
         console.error('Assign error:', error);
         res.status(500).json({ message: 'Failed to assign link' });
     }
@@ -625,18 +605,23 @@ app.post('/api/admin/unassign', authMiddleware('admin'), async (req, res) => {
         const { smartlinkId } = req.body;
         if (!smartlinkId) return res.status(400).json({ message: 'Smartlink ID required' });
 
-        const assignmentDoc = await db.collection('assignments').doc(smartlinkId).get();
+        const assignmentDoc = await db.collection('assignments').doc(String(smartlinkId)).get();
         if (!assignmentDoc.exists) return res.status(404).json({ message: 'Assignment not found' });
 
         const uid = assignmentDoc.data().userId;
-        await db.collection('assignments').doc(smartlinkId).delete();
+        await db.collection('assignments').doc(String(smartlinkId)).delete();
 
+        // If user has no more assignments, clear their legacy smartlinkId
         const remainingAssignments = await db.collection('assignments').where('userId', '==', uid).get();
         if (remainingAssignments.empty) {
             await db.collection('users').doc(uid).update({ smartlinkId: null });
+        } else {
+            // Set to any one remaining
+            const nextId = remainingAssignments.docs[0].data().smartlinkId;
+            await db.collection('users').doc(uid).update({ smartlinkId: nextId });
         }
 
-        res.json({ message: 'Link unassigned successfully' });
+        res.json({ message: 'Link released back to available pool.' });
     } catch (error) {
         console.error('Unassign error:', error);
         res.status(500).json({ message: 'Failed to unassign link' });
@@ -662,17 +647,12 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
     }
 });
 
-// -----------------------------
-// 9. FIX EXISTING ASSIGNMENT NAMES
-// -----------------------------
 app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
     try {
         console.log('🔄 Starting name fix for all assignments...');
         const adsterraLinks = await fetchSmartlinksFromAdsterra();
         const nameMap = {};
         adsterraLinks.forEach(link => { nameMap[link.id] = link.name; });
-
-        console.log(`✅ Fetched ${Object.keys(nameMap).length} real names from Adsterra`);
 
         const assignmentsSnapshot = await db.collection('assignments').get();
         let updatedCount = 0;
@@ -685,10 +665,8 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
             if (realName && realName !== data.smartlinkName) {
                 batch.update(doc.ref, { smartlinkName: realName });
                 updatedCount++;
-                console.log(`✅ Updated ${data.smartlinkId}: ${data.smartlinkName} → ${realName}`);
             } else if (!realName) {
                 notFoundCount++;
-                console.warn(`⚠️ No real name found for ${data.smartlinkId}`);
             }
         });
 
@@ -705,9 +683,104 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
     }
 });
 
-// -----------------------------
-// 10. USER STATS
-// -----------------------------
+// ================================================================
+// 10. NEW: USER — AVAILABLE LINKS + CLAIM
+// ================================================================
+
+/**
+ * GET /api/user/available-links
+ * Returns all Adsterra links NOT claimed by anyone.
+ */
+app.get('/api/user/available-links', authMiddleware('user'), async (req, res) => {
+    try {
+        const adsterraLinks = await fetchSmartlinksFromAdsterra();
+
+        // Get all claimed assignment IDs
+        const assignmentsSnapshot = await db.collection('assignments').get();
+        const claimedIds = new Set();
+        assignmentsSnapshot.forEach(doc => claimedIds.add(doc.data().smartlinkId));
+
+        const available = adsterraLinks
+            .filter(link => !claimedIds.has(String(link.id)))
+            .map(link => ({
+                id: link.id,
+                name: link.name,
+                url: link.url,
+            }));
+
+        res.json({ links: available, count: available.length });
+    } catch (error) {
+        console.error('Available links error:', error);
+        res.status(500).json({ message: 'Failed to fetch available links', error: error.message });
+    }
+});
+
+/**
+ * POST /api/user/claim-link
+ * Body: { smartlinkId }
+ * Atomic claim — race-condition safe.
+ */
+app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const email = req.user.email;
+        const { smartlinkId } = req.body;
+
+        if (!smartlinkId) return res.status(400).json({ message: 'Smartlink ID required' });
+
+        // Verify link exists in Adsterra
+        const adsterraLinks = await fetchSmartlinksFromAdsterra();
+        const link = adsterraLinks.find(l => String(l.id) === String(smartlinkId));
+        if (!link) {
+            return res.status(404).json({ message: 'Link not found in Adsterra pool.' });
+        }
+
+        // Atomic claim
+        await db.runTransaction(async (transaction) => {
+            const assignmentRef = db.collection('assignments').doc(String(smartlinkId));
+            const userRef = db.collection('users').doc(uid);
+
+            const assignmentDoc = await transaction.get(assignmentRef);
+            const userDoc = await transaction.get(userRef);
+
+            if (assignmentDoc.exists) {
+                throw new Error('ALREADY_CLAIMED');
+            }
+            if (!userDoc.exists) {
+                throw new Error('USER_NOT_FOUND');
+            }
+
+            transaction.set(assignmentRef, {
+                userId: uid,
+                userEmail: email,
+                smartlinkId: String(smartlinkId),
+                smartlinkName: link.name,
+                assignedAt: admin.firestore.FieldValue.serverTimestamp(),
+                claimedBySelf: true,
+            });
+
+            transaction.update(userRef, { smartlinkId: String(smartlinkId) });
+        });
+
+        res.json({
+            message: `Link "${link.name}" claimed successfully!`,
+            link: { id: link.id, name: link.name, url: link.url },
+        });
+    } catch (error) {
+        if (error.message === 'ALREADY_CLAIMED') {
+            return res.status(409).json({ message: 'This link has already been claimed by another user.' });
+        }
+        if (error.message === 'USER_NOT_FOUND') {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+        console.error('Claim link error:', error);
+        res.status(500).json({ message: 'Failed to claim link', error: error.message });
+    }
+});
+
+// ================================================================
+// 11. USER STATS + ANALYTICS
+// ================================================================
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -745,8 +818,8 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
 
         res.json({
             userEmail: userData.email,
-            permissions: permissions,
-            smartlinks: smartlinks,
+            permissions,
+            smartlinks,
         });
     } catch (error) {
         console.error('User stats error:', error);
@@ -754,16 +827,10 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     }
 });
 
-// -----------------------------
-// 11. USER ANALYTICS
-// -----------------------------
 app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
     try {
         const currentUid = req.user.uid;
-
-        const usersSnapshot = await db.collection('users')
-            .where('role', '==', 'user')
-            .get();
+        const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
 
         const otherUsers = [];
         for (const doc of usersSnapshot.docs) {
@@ -780,12 +847,8 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
         const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
         const analytics = [];
-
         for (const user of otherUsers) {
-            const assignmentsSnapshot = await db.collection('assignments')
-                .where('userId', '==', user.uid)
-                .get();
-
+            const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', user.uid).get();
             let totalClicks = 0;
 
             if (!assignmentsSnapshot.empty) {
@@ -794,10 +857,9 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
                     const smartlinkId = assignmentData.smartlinkId;
                     try {
                         const rawStats = await fetchStatsFromAdsterra(today, tomorrow, smartlinkId);
-                        const clicks = rawStats.clicks || 0;
-                        totalClicks += clicks;
+                        totalClicks += rawStats.clicks || 0;
                     } catch (error) {
-                        console.warn(`⚠️ Failed to fetch stats for link ${smartlinkId} for user ${user.email}:`, error.message);
+                        console.warn(`⚠️ Analytics stats failed for link ${smartlinkId}:`, error.message);
                     }
                 }
             }
@@ -805,16 +867,12 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             analytics.push({
                 displayName: user.displayName,
                 email: user.email,
-                totalClicks: totalClicks,
+                totalClicks,
             });
         }
 
         analytics.sort((a, b) => b.totalClicks - a.totalClicks);
-
-        res.json({
-            users: analytics,
-            updatedAt: new Date().toISOString(),
-        });
+        res.json({ users: analytics, updatedAt: new Date().toISOString() });
     } catch (error) {
         console.error('User analytics error:', error);
         res.status(500).json({ message: 'Failed to fetch user analytics' });
@@ -822,24 +880,15 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
 });
 
 // ================================================================
-// 12. NEW: GOALS ENDPOINTS
+// 12. USER GOALS (unchanged)
 // ================================================================
-
-/**
- * Helper: Get aggregated stats for a user across all their links for a date range
- */
 const getUserAggregatedStats = async (uid, dateFrom, dateTo) => {
     const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
     if (assignmentsSnapshot.empty) {
         return { impressions: 0, clicks: 0, revenue: 0, cpm: 0, rpm: 0 };
     }
 
-    let totalImpressions = 0;
-    let totalClicks = 0;
-    let totalRevenue = 0;
-    let totalCpm = 0;
-    let totalRpm = 0;
-    let count = 0;
+    let totalImpressions = 0, totalClicks = 0, totalRevenue = 0, totalCpm = 0, totalRpm = 0, count = 0;
 
     for (const doc of assignmentsSnapshot.docs) {
         const data = doc.data();
@@ -853,7 +902,7 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo) => {
             totalRpm += rawStats.rpm || 0;
             count++;
         } catch (error) {
-            console.warn(`⚠️ Failed to fetch stats for goal aggregation (link ${smartlinkId}):`, error.message);
+            console.warn(`⚠️ Goal agg stats failed for link ${smartlinkId}:`, error.message);
         }
     }
 
@@ -866,18 +915,12 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo) => {
     };
 };
 
-// GET /api/user/goals
 app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
-
-        // Fetch goals from Firestore subcollection
         const goalsSnapshot = await db.collection('users').doc(uid).collection('goals').get();
-        if (goalsSnapshot.empty) {
-            return res.json({ goals: [] });
-        }
+        if (goalsSnapshot.empty) return res.json({ goals: [] });
 
-        // Get current stats for the user (last 30 days for progress)
         const today = new Date().toISOString().split('T')[0];
         const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const currentStats = await getUserAggregatedStats(uid, thirtyDaysAgo, today);
@@ -885,40 +928,26 @@ app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
         const goals = [];
         goalsSnapshot.forEach(doc => {
             const data = doc.data();
-            const goalId = doc.id;
-
-            // Calculate current value and progress based on type
             let current = 0;
             switch (data.type) {
-                case 'revenue':
-                    current = currentStats.revenue || 0;
-                    break;
-                case 'clicks':
-                    current = currentStats.clicks || 0;
-                    break;
-                case 'impressions':
-                    current = currentStats.impressions || 0;
-                    break;
-                case 'rpm':
-                    current = currentStats.rpm || 0;
-                    break;
-                default:
-                    current = 0;
+                case 'revenue': current = currentStats.revenue || 0; break;
+                case 'clicks': current = currentStats.clicks || 0; break;
+                case 'impressions': current = currentStats.impressions || 0; break;
+                case 'rpm': current = currentStats.rpm || 0; break;
             }
-
             const target = data.target || 1;
             const progress = target > 0 ? Math.min((current / target) * 100, 100) : 0;
 
             goals.push({
-                id: goalId,
+                id: doc.id,
                 type: data.type,
                 title: data.title || data.type.charAt(0).toUpperCase() + data.type.slice(1),
                 target: data.target,
-                current: current,
-                progress: progress,
+                current,
+                progress,
                 deadline: data.deadline || null,
-                createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : new Date().toISOString(),
-                updatedAt: data.updatedAt ? data.updatedAt.toDate().toISOString() : new Date().toISOString(),
+                createdAt: safeDateToISO(data.createdAt) || new Date().toISOString(),
+                updatedAt: safeDateToISO(data.updatedAt) || new Date().toISOString(),
             });
         });
 
@@ -929,18 +958,13 @@ app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
     }
 });
 
-// POST /api/user/goals
 app.post('/api/user/goals', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
         const { type, target, deadline } = req.body;
 
-        if (!type || !target || target <= 0) {
-            return res.status(400).json({ message: 'Type and valid target are required.' });
-        }
-
-        const validTypes = ['revenue', 'clicks', 'impressions', 'rpm'];
-        if (!validTypes.includes(type)) {
+        if (!type || !target || target <= 0) return res.status(400).json({ message: 'Type and valid target are required.' });
+        if (!['revenue', 'clicks', 'impressions', 'rpm'].includes(type)) {
             return res.status(400).json({ message: 'Invalid goal type.' });
         }
 
@@ -954,43 +978,28 @@ app.post('/api/user/goals', authMiddleware('user'), async (req, res) => {
         };
 
         const docRef = await db.collection('users').doc(uid).collection('goals').add(goalData);
-
-        res.status(201).json({
-            message: 'Goal created successfully!',
-            goalId: docRef.id,
-        });
+        res.status(201).json({ message: 'Goal created successfully!', goalId: docRef.id });
     } catch (error) {
         console.error('Create goal error:', error);
         res.status(500).json({ message: 'Failed to create goal', error: error.message });
     }
 });
 
-// PUT /api/user/goals/:goalId
 app.put('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
         const { goalId } = req.params;
         const { type, target, deadline } = req.body;
 
-        if (!goalId) {
-            return res.status(400).json({ message: 'Goal ID required.' });
-        }
-
-        if (!type || !target || target <= 0) {
-            return res.status(400).json({ message: 'Type and valid target are required.' });
-        }
-
-        const validTypes = ['revenue', 'clicks', 'impressions', 'rpm'];
-        if (!validTypes.includes(type)) {
+        if (!goalId) return res.status(400).json({ message: 'Goal ID required.' });
+        if (!type || !target || target <= 0) return res.status(400).json({ message: 'Type and valid target are required.' });
+        if (!['revenue', 'clicks', 'impressions', 'rpm'].includes(type)) {
             return res.status(400).json({ message: 'Invalid goal type.' });
         }
 
         const goalRef = db.collection('users').doc(uid).collection('goals').doc(goalId);
         const goalDoc = await goalRef.get();
-
-        if (!goalDoc.exists) {
-            return res.status(404).json({ message: 'Goal not found.' });
-        }
+        if (!goalDoc.exists) return res.status(404).json({ message: 'Goal not found.' });
 
         await goalRef.update({
             type,
@@ -1007,25 +1016,17 @@ app.put('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
     }
 });
 
-// DELETE /api/user/goals/:goalId
 app.delete('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
         const { goalId } = req.params;
-
-        if (!goalId) {
-            return res.status(400).json({ message: 'Goal ID required.' });
-        }
+        if (!goalId) return res.status(400).json({ message: 'Goal ID required.' });
 
         const goalRef = db.collection('users').doc(uid).collection('goals').doc(goalId);
         const goalDoc = await goalRef.get();
-
-        if (!goalDoc.exists) {
-            return res.status(404).json({ message: 'Goal not found.' });
-        }
+        if (!goalDoc.exists) return res.status(404).json({ message: 'Goal not found.' });
 
         await goalRef.delete();
-
         res.json({ message: 'Goal deleted successfully!' });
     } catch (error) {
         console.error('Delete goal error:', error);
@@ -1034,76 +1035,578 @@ app.delete('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) =
 });
 
 // ================================================================
-// 13. NEW: LEADERBOARD ENDPOINT
+// 13. NEW: USER — WITHDRAWAL REQUESTS
 // ================================================================
 
+const WITHDRAWAL_METHODS = ['jazzcash', 'easypaisa', 'bank', 'crypto'];
+const MIN_WITHDRAWAL_USD = 1;
+
+function validateWithdrawalPayload(body) {
+    const { amount, method } = body;
+
+    const amt = parseFloat(amount);
+    if (isNaN(amt) || amt <= 0) return 'Amount must be greater than 0.';
+    if (amt < MIN_WITHDRAWAL_USD) return `Minimum withdrawal amount is $${MIN_WITHDRAWAL_USD}.`;
+    if (!WITHDRAWAL_METHODS.includes(method)) return 'Invalid withdrawal method.';
+
+    if (method === 'jazzcash' || method === 'easypaisa') {
+        if (!body.accountName || !String(body.accountName).trim()) return 'Account holder name is required.';
+        if (!body.accountNumber || !String(body.accountNumber).trim()) return 'Account number is required.';
+    }
+    if (method === 'bank') {
+        if (!body.accountName || !String(body.accountName).trim()) return 'Account holder name is required.';
+        if (!body.iban || !String(body.iban).trim()) return 'IBAN is required.';
+    }
+    if (method === 'crypto') {
+        if (!body.binanceUid || !String(body.binanceUid).trim()) return 'Binance UID is required.';
+        if (!body.usdtAddress || !String(body.usdtAddress).trim()) return 'USDT (BEP20) address is required.';
+    }
+
+    return null;
+}
+
+/**
+ * POST /api/user/withdrawal-request
+ * Body: { amount, method, accountName?, accountNumber?, iban?, binanceUid?, usdtAddress? }
+ */
+app.post('/api/user/withdrawal-request', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const email = req.user.email;
+
+        const validationError = validateWithdrawalPayload(req.body);
+        if (validationError) return res.status(400).json({ message: validationError });
+
+        const userDoc = await db.collection('users').doc(uid).get();
+        if (!userDoc.exists) return res.status(404).json({ message: 'User not found.' });
+        const userData = userDoc.data();
+
+        const { amount, method, accountName, accountNumber, iban, binanceUid, usdtAddress } = req.body;
+
+        const requestData = {
+            userId: uid,
+            userEmail: email,
+            userName: userData.displayName || email.split('@')[0] || 'User',
+            amount: parseFloat(amount),
+            method,
+            status: 'pending',
+            rejectionReason: null,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            processedBy: null,
+            processedAt: null,
+        };
+
+        // Add method-specific fields
+        if (method === 'jazzcash' || method === 'easypaisa') {
+            requestData.accountName = String(accountName).trim();
+            requestData.accountNumber = String(accountNumber).trim();
+        } else if (method === 'bank') {
+            requestData.accountName = String(accountName).trim();
+            requestData.iban = String(iban).trim();
+            if (accountNumber) requestData.accountNumber = String(accountNumber).trim();
+            if (req.body.bankName) requestData.bankName = String(req.body.bankName).trim();
+        } else if (method === 'crypto') {
+            requestData.binanceUid = String(binanceUid).trim();
+            requestData.usdtAddress = String(usdtAddress).trim();
+            requestData.cryptoNetwork = 'BEP20';
+        }
+
+        const docRef = await db.collection('withdrawalRequests').add(requestData);
+
+        res.status(201).json({
+            message: 'Withdrawal request submitted successfully! Admin will review it soon.',
+            requestId: docRef.id,
+        });
+    } catch (error) {
+        console.error('Create withdrawal error:', error);
+        res.status(500).json({ message: 'Failed to create withdrawal request', error: error.message });
+    }
+});
+
+/**
+ * GET /api/user/withdrawal-requests
+ * Returns the current user's withdrawal history.
+ */
+app.get('/api/user/withdrawal-requests', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const limit = getLimit(req, 100, 200);
+
+        const snapshot = await db.collection('withdrawalRequests')
+            .where('userId', '==', uid)
+            .get();
+
+        const requests = [];
+        snapshot.forEach(doc => {
+            const d = doc.data();
+            requests.push({
+                id: doc.id,
+                amount: d.amount,
+                method: d.method,
+                status: d.status,
+                rejectionReason: d.rejectionReason || null,
+                accountName: d.accountName || null,
+                accountNumber: d.accountNumber || null,
+                iban: d.iban || null,
+                bankName: d.bankName || null,
+                binanceUid: d.binanceUid || null,
+                usdtAddress: d.usdtAddress || null,
+                cryptoNetwork: d.cryptoNetwork || null,
+                createdAt: safeDateToISO(d.createdAt),
+                updatedAt: safeDateToISO(d.updatedAt),
+                processedAt: safeDateToISO(d.processedAt),
+                processedBy: d.processedBy || null,
+            });
+        });
+
+        // Sort newest first
+        requests.sort((a, b) => {
+            const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+            const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+            return bt - at;
+        });
+
+        res.json({ requests: requests.slice(0, limit), count: requests.length });
+    } catch (error) {
+        console.error('Fetch withdrawal requests error:', error);
+        res.status(500).json({ message: 'Failed to fetch withdrawal requests', error: error.message });
+    }
+});
+
+// ================================================================
+// 14. NEW: ADMIN — WITHDRAWAL MANAGEMENT
+// ================================================================
+
+/**
+ * GET /api/admin/withdrawal-requests?status=pending|processing|approved|rejected|all
+ */
+app.get('/api/admin/withdrawal-requests', authMiddleware('admin'), async (req, res) => {
+    try {
+        const status = req.query.status || 'all';
+        const limit = getLimit(req, 200, 500);
+
+        let query = db.collection('withdrawalRequests');
+        if (status !== 'all') {
+            query = query.where('status', '==', status);
+        }
+
+        const snapshot = await query.get();
+        const requests = [];
+        snapshot.forEach(doc => {
+            const d = doc.data();
+            requests.push({
+                id: doc.id,
+                userId: d.userId,
+                userEmail: d.userEmail,
+                userName: d.userName,
+                amount: d.amount,
+                method: d.method,
+                status: d.status,
+                rejectionReason: d.rejectionReason || null,
+                accountName: d.accountName || null,
+                accountNumber: d.accountNumber || null,
+                iban: d.iban || null,
+                bankName: d.bankName || null,
+                binanceUid: d.binanceUid || null,
+                usdtAddress: d.usdtAddress || null,
+                cryptoNetwork: d.cryptoNetwork || null,
+                createdAt: safeDateToISO(d.createdAt),
+                updatedAt: safeDateToISO(d.updatedAt),
+                processedAt: safeDateToISO(d.processedAt),
+                processedBy: d.processedBy || null,
+            });
+        });
+
+        requests.sort((a, b) => {
+            const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+            const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+            return bt - at;
+        });
+
+        res.json({ requests: requests.slice(0, limit), count: requests.length });
+    } catch (error) {
+        console.error('Admin fetch withdrawals error:', error);
+        res.status(500).json({ message: 'Failed to fetch withdrawal requests', error: error.message });
+    }
+});
+
+/**
+ * PATCH /api/admin/withdrawal-requests/:id
+ * Body: { status: 'pending'|'processing'|'approved'|'rejected', rejectionReason?: string }
+ * rejectionReason is REQUIRED when status = 'rejected'.
+ */
+app.patch('/api/admin/withdrawal-requests/:id', authMiddleware('admin'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status, rejectionReason } = req.body;
+
+        if (!id) return res.status(400).json({ message: 'Request ID required.' });
+        if (!['pending', 'processing', 'approved', 'rejected'].includes(status)) {
+            return res.status(400).json({ message: 'Invalid status.' });
+        }
+        if (status === 'rejected' && (!rejectionReason || !String(rejectionReason).trim())) {
+            return res.status(400).json({ message: 'Rejection reason is required when rejecting.' });
+        }
+
+        const requestRef = db.collection('withdrawalRequests').doc(id);
+        const requestDoc = await requestRef.get();
+        if (!requestDoc.exists) return res.status(404).json({ message: 'Withdrawal request not found.' });
+
+        const updateData = {
+            status,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            processedBy: req.user.email,
+            processedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+
+        if (status === 'rejected') {
+            updateData.rejectionReason = String(rejectionReason).trim();
+        } else {
+            // Clear rejection reason if moving away from rejected
+            updateData.rejectionReason = null;
+        }
+
+        await requestRef.update(updateData);
+
+        res.json({ message: `Withdrawal request marked as "${status}".` });
+    } catch (error) {
+        console.error('Update withdrawal status error:', error);
+        res.status(500).json({ message: 'Failed to update withdrawal request', error: error.message });
+    }
+});
+
+// ================================================================
+// 15. NEW: USER — LIVE CHAT (with admin)
+// ================================================================
+
+/**
+ * GET /api/user/chat/messages
+ * Returns user's conversation with admin (last 100 messages, oldest first).
+ */
+app.get('/api/user/chat/messages', authMiddleware('user'), async (req, res) => {
+    try {
+        const userEmail = req.user.email;
+        const limit = getLimit(req, 100, 300);
+
+        const snapshot = await db.collection('chatMessages')
+            .where('userEmail', '==', userEmail)
+            .get();
+
+        const messages = [];
+        snapshot.forEach(doc => {
+            const d = doc.data();
+            messages.push({
+                id: doc.id,
+                fromRole: d.fromRole,
+                fromEmail: d.fromEmail,
+                message: d.message,
+                read: d.read || false,
+                createdAt: safeDateToISO(d.createdAt),
+            });
+        });
+
+        messages.sort((a, b) => {
+            const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+            const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+            return at - bt;
+        });
+
+        const recent = messages.slice(-limit);
+        res.json({ messages: recent, total: messages.length });
+    } catch (error) {
+        console.error('User chat fetch error:', error);
+        res.status(500).json({ message: 'Failed to fetch chat messages', error: error.message });
+    }
+});
+
+/**
+ * POST /api/user/chat/send
+ * Body: { message }
+ */
+app.post('/api/user/chat/send', authMiddleware('user'), async (req, res) => {
+    try {
+        const userEmail = req.user.email;
+        const { message } = req.body;
+
+        if (!message || !String(message).trim()) {
+            return res.status(400).json({ message: 'Message cannot be empty.' });
+        }
+        if (String(message).length > 2000) {
+            return res.status(400).json({ message: 'Message too long (max 2000 chars).' });
+        }
+
+        const docRef = await db.collection('chatMessages').add({
+            userEmail,
+            userId: req.user.uid,
+            fromRole: 'user',
+            fromEmail: userEmail,
+            message: String(message).trim(),
+            read: false,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        res.status(201).json({ message: 'Message sent.', messageId: docRef.id });
+    } catch (error) {
+        console.error('User chat send error:', error);
+        res.status(500).json({ message: 'Failed to send message', error: error.message });
+    }
+});
+
+/**
+ * PATCH /api/user/chat/read
+ * Marks all admin→user messages as read.
+ */
+app.patch('/api/user/chat/read', authMiddleware('user'), async (req, res) => {
+    try {
+        const userEmail = req.user.email;
+
+        const snapshot = await db.collection('chatMessages')
+            .where('userEmail', '==', userEmail)
+            .where('fromRole', '==', 'admin')
+            .where('read', '==', false)
+            .get();
+
+        const batch = db.batch();
+        snapshot.forEach(doc => batch.update(doc.ref, { read: true }));
+        await batch.commit();
+
+        res.json({ message: 'Marked as read', count: snapshot.size });
+    } catch (error) {
+        console.error('User chat read error:', error);
+        res.status(500).json({ message: 'Failed to mark messages as read', error: error.message });
+    }
+});
+
+// ================================================================
+// 16. NEW: ADMIN — LIVE CHAT MANAGEMENT
+// ================================================================
+
+/**
+ * GET /api/admin/chat/users
+ * Returns list of users who have chat threads (with unread count + last message).
+ */
+app.get('/api/admin/chat/users', authMiddleware('admin'), async (req, res) => {
+    try {
+        // Fetch ALL messages (small scale assumption — optimize later with indexes)
+        const snapshot = await db.collection('chatMessages').get();
+
+        const threadsMap = {};
+        let totalUnread = 0;
+
+        snapshot.forEach(doc => {
+            const d = doc.data();
+            const email = d.userEmail;
+            if (!email) return;
+
+            const ts = d.createdAt ? d.createdAt.toDate().getTime() : 0;
+            const isUnread = d.fromRole === 'user' && !d.read;
+
+            if (isUnread) totalUnread++;
+
+            if (!threadsMap[email]) {
+                threadsMap[email] = {
+                    userEmail: email,
+                    userName: email.split('@')[0],
+                    lastMessage: d.message,
+                    lastMessageAt: ts,
+                    lastFromRole: d.fromRole,
+                    unreadCount: isUnread ? 1 : 0,
+                };
+            } else {
+                if (isUnread) threadsMap[email].unreadCount++;
+                if (ts > threadsMap[email].lastMessageAt) {
+                    threadsMap[email].lastMessage = d.message;
+                    threadsMap[email].lastMessageAt = ts;
+                    threadsMap[email].lastFromRole = d.fromRole;
+                }
+            }
+        });
+
+        // Enrich with real display names
+        const emails = Object.keys(threadsMap);
+        if (emails.length > 0) {
+            const usersSnapshot = await db.collection('users').where('email', 'in', emails.slice(0, 10)).get();
+            usersSnapshot.forEach(userDoc => {
+                const ud = userDoc.data();
+                if (ud.email && threadsMap[ud.email]) {
+                    threadsMap[ud.email].userName = ud.displayName || ud.email.split('@')[0];
+                }
+            });
+        }
+
+        const threads = Object.values(threadsMap).sort((a, b) => b.lastMessageAt - a.lastMessageAt);
+
+        res.json({
+            threads,
+            totalUnread,
+            totalThreads: threads.length,
+        });
+    } catch (error) {
+        console.error('Admin chat users error:', error);
+        res.status(500).json({ message: 'Failed to fetch chat threads', error: error.message });
+    }
+});
+
+/**
+ * GET /api/admin/chat/messages/:userEmail
+ * Returns full conversation for a given user email.
+ */
+app.get('/api/admin/chat/messages/:userEmail', authMiddleware('admin'), async (req, res) => {
+    try {
+        const userEmail = decodeURIComponent(req.params.userEmail);
+        if (!userEmail) return res.status(400).json({ message: 'User email required.' });
+        const limit = getLimit(req, 100, 300);
+
+        const snapshot = await db.collection('chatMessages')
+            .where('userEmail', '==', userEmail)
+            .get();
+
+        const messages = [];
+        snapshot.forEach(doc => {
+            const d = doc.data();
+            messages.push({
+                id: doc.id,
+                fromRole: d.fromRole,
+                fromEmail: d.fromEmail,
+                message: d.message,
+                read: d.read || false,
+                createdAt: safeDateToISO(d.createdAt),
+            });
+        });
+
+        messages.sort((a, b) => {
+            const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+            const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+            return at - bt;
+        });
+
+        res.json({ messages: messages.slice(-limit), total: messages.length });
+    } catch (error) {
+        console.error('Admin chat messages error:', error);
+        res.status(500).json({ message: 'Failed to fetch messages', error: error.message });
+    }
+});
+
+/**
+ * POST /api/admin/chat/send
+ * Body: { userEmail, message }
+ */
+app.post('/api/admin/chat/send', authMiddleware('admin'), async (req, res) => {
+    try {
+        const { userEmail, message } = req.body;
+        if (!userEmail || !String(userEmail).trim()) {
+            return res.status(400).json({ message: 'User email required.' });
+        }
+        if (!message || !String(message).trim()) {
+            return res.status(400).json({ message: 'Message cannot be empty.' });
+        }
+        if (String(message).length > 2000) {
+            return res.status(400).json({ message: 'Message too long (max 2000 chars).' });
+        }
+
+        // Validate user exists
+        const userSnapshot = await db.collection('users')
+            .where('email', '==', String(userEmail).trim())
+            .where('role', '==', 'user')
+            .get();
+        if (userSnapshot.empty) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        const docRef = await db.collection('chatMessages').add({
+            userEmail: String(userEmail).trim(),
+            userId: userSnapshot.docs[0].id,
+            fromRole: 'admin',
+            fromEmail: req.user.email,
+            message: String(message).trim(),
+            read: false,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        res.status(201).json({ message: 'Message sent.', messageId: docRef.id });
+    } catch (error) {
+        console.error('Admin chat send error:', error);
+        res.status(500).json({ message: 'Failed to send message', error: error.message });
+    }
+});
+
+/**
+ * PATCH /api/admin/chat/read/:userEmail
+ * Marks all user→admin messages as read for a given user.
+ */
+app.patch('/api/admin/chat/read/:userEmail', authMiddleware('admin'), async (req, res) => {
+    try {
+        const userEmail = decodeURIComponent(req.params.userEmail);
+        if (!userEmail) return res.status(400).json({ message: 'User email required.' });
+
+        const snapshot = await db.collection('chatMessages')
+            .where('userEmail', '==', userEmail)
+            .where('fromRole', '==', 'user')
+            .where('read', '==', false)
+            .get();
+
+        const batch = db.batch();
+        snapshot.forEach(doc => batch.update(doc.ref, { read: true }));
+        await batch.commit();
+
+        res.json({ message: 'Marked as read', count: snapshot.size });
+    } catch (error) {
+        console.error('Admin chat read error:', error);
+        res.status(500).json({ message: 'Failed to mark as read', error: error.message });
+    }
+});
+
+// ================================================================
+// 17. LEADERBOARD (unchanged)
+// ================================================================
 app.get('/api/leaderboard', authMiddleware('user'), async (req, res) => {
     try {
         const { period = 'week' } = req.query;
 
-        // Calculate date range
         const today = new Date();
         const todayStr = today.toISOString().split('T')[0];
-        let fromDate = new Date(today);
-        if (period === 'week') {
-            fromDate.setDate(fromDate.getDate() - 7);
-        } else if (period === 'month') {
-            fromDate.setDate(fromDate.getDate() - 30);
-        } else {
-            return res.status(400).json({ message: 'Invalid period. Use "week" or "month".' });
-        }
+        const fromDate = new Date(today);
+        if (period === 'week') fromDate.setDate(fromDate.getDate() - 7);
+        else if (period === 'month') fromDate.setDate(fromDate.getDate() - 30);
+        else return res.status(400).json({ message: 'Invalid period. Use "week" or "month".' });
+
         const fromStr = fromDate.toISOString().split('T')[0];
 
-        // Get all users
         const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
-        if (usersSnapshot.empty) {
-            return res.json({ users: [] });
-        }
+        if (usersSnapshot.empty) return res.json({ users: [] });
 
         const leaderboardData = [];
-
         for (const userDoc of usersSnapshot.docs) {
             const userData = userDoc.data();
             const uid = userDoc.id;
 
-            // Get assignments for this user
             const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
-            if (assignmentsSnapshot.empty) {
-                // User has no links, skip
-                continue;
-            }
+            if (assignmentsSnapshot.empty) continue;
 
             let totalRevenue = 0;
-
-            // Fetch stats for each assignment and sum revenue
             const statsPromises = [];
             assignmentsSnapshot.forEach(doc => {
                 const data = doc.data();
-                const smartlinkId = data.smartlinkId;
-                statsPromises.push(fetchStatsFromAdsterra(fromStr, todayStr, smartlinkId));
+                statsPromises.push(fetchStatsFromAdsterra(fromStr, todayStr, data.smartlinkId));
             });
 
             const statsResults = await Promise.all(statsPromises);
-            statsResults.forEach(stats => {
-                totalRevenue += stats.revenue || 0;
-            });
+            statsResults.forEach(stats => { totalRevenue += stats.revenue || 0; });
 
             leaderboardData.push({
-                uid: uid,
+                uid,
                 email: userData.email,
                 displayName: userData.displayName || userData.email.split('@')[0] || 'User',
                 revenue: totalRevenue,
             });
         }
 
-        // Sort by revenue descending
         leaderboardData.sort((a, b) => b.revenue - a.revenue);
-
-        // Return top 20 or all
         const topUsers = leaderboardData.slice(0, 20);
 
         res.json({
-            period: period,
+            period,
             from: fromStr,
             to: todayStr,
             users: topUsers,
@@ -1115,15 +1618,10 @@ app.get('/api/leaderboard', authMiddleware('user'), async (req, res) => {
 });
 
 // ================================================================
-// 14. OLD: CHART DATA ENDPOINTS (REAL DAILY STATS)
+// 18. CHART DATA (unchanged)
 // ================================================================
-
-/**
- * Helper: Aggregate daily stats across multiple links
- */
 const aggregateDailyStats = async (linkIds, days) => {
     const dailyMap = {};
-    // Initialize all days
     const now = new Date();
     for (let i = days - 1; i >= 0; i--) {
         const d = new Date(now);
@@ -1132,7 +1630,6 @@ const aggregateDailyStats = async (linkIds, days) => {
         dailyMap[dateStr] = { date: dateStr, impressions: 0, clicks: 0, revenue: 0 };
     }
 
-    // For each link, fetch daily stats and add to map
     for (const linkId of linkIds) {
         try {
             const dailyStats = await fetchDailyStatsForLink(linkId, days);
@@ -1148,40 +1645,32 @@ const aggregateDailyStats = async (linkIds, days) => {
         }
     }
 
-    // Convert map to sorted array
     const sortedDates = Object.keys(dailyMap).sort();
     return sortedDates.map(date => dailyMap[date]);
 };
 
-// Admin chart data endpoint
 app.get('/api/admin/chart-data', authMiddleware('admin'), async (req, res) => {
     try {
         const days = parseInt(req.query.days) || 7;
         if (days < 1 || days > 90) return res.status(400).json({ message: 'Days must be between 1 and 90' });
 
-        // Get all smartlinks from Adsterra
         const allLinks = await fetchSmartlinksFromAdsterra();
         const linkIds = allLinks.map(l => l.id);
-
-        if (linkIds.length === 0) {
-            return res.json({ labels: [], impressions: [], clicks: [], revenue: [] });
-        }
+        if (linkIds.length === 0) return res.json({ labels: [], impressions: [], clicks: [], revenue: [] });
 
         const dailyData = await aggregateDailyStats(linkIds, days);
-
-        const labels = dailyData.map(d => d.date);
-        const impressions = dailyData.map(d => d.impressions);
-        const clicks = dailyData.map(d => d.clicks);
-        const revenue = dailyData.map(d => d.revenue);
-
-        res.json({ labels, impressions, clicks, revenue });
+        res.json({
+            labels: dailyData.map(d => d.date),
+            impressions: dailyData.map(d => d.impressions),
+            clicks: dailyData.map(d => d.clicks),
+            revenue: dailyData.map(d => d.revenue),
+        });
     } catch (error) {
         console.error('Admin chart data error:', error);
         res.status(500).json({ message: 'Failed to fetch chart data', error: error.message });
     }
 });
 
-// User chart data endpoint
 app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
     try {
         const days = parseInt(req.query.days) || 7;
@@ -1195,18 +1684,15 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
             if (data.smartlinkId) linkIds.push(data.smartlinkId);
         });
 
-        if (linkIds.length === 0) {
-            return res.json({ labels: [], impressions: [], clicks: [], revenue: [] });
-        }
+        if (linkIds.length === 0) return res.json({ labels: [], impressions: [], clicks: [], revenue: [] });
 
         const dailyData = await aggregateDailyStats(linkIds, days);
-
-        const labels = dailyData.map(d => d.date);
-        const impressions = dailyData.map(d => d.impressions);
-        const clicks = dailyData.map(d => d.clicks);
-        const revenue = dailyData.map(d => d.revenue);
-
-        res.json({ labels, impressions, clicks, revenue });
+        res.json({
+            labels: dailyData.map(d => d.date),
+            impressions: dailyData.map(d => d.impressions),
+            clicks: dailyData.map(d => d.clicks),
+            revenue: dailyData.map(d => d.revenue),
+        });
     } catch (error) {
         console.error('User chart data error:', error);
         res.status(500).json({ message: 'Failed to fetch chart data', error: error.message });
@@ -1214,13 +1700,27 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 15. ROOT / HEALTH CHECK
+// 19. ROOT / HEALTH CHECK
 // -----------------------------
 app.get('/api', (req, res) => {
     res.json({
         name: 'Lunar Metrics API',
-        version: '1.2.0', // Updated version
+        version: '1.3.0',
         status: 'operational',
+        features: [
+            'auth',
+            'adsterra-smartlinks',
+            'admin-users',
+            'admin-links',
+            'user-stats',
+            'user-analytics',
+            'goals',
+            'leaderboard',
+            'chart-data',
+            'self-service-claiming',   // NEW
+            'withdrawals',             // NEW
+            'live-chat',               // NEW
+        ],
         timestamp: new Date().toISOString(),
     });
 });
