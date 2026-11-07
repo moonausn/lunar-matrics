@@ -1,21 +1,11 @@
 // ============================================
-// LUNAR METRICS · MASTER BACKEND (v1.6.2)
+// LUNAR METRICS · MASTER BACKEND (v1.6.4)
 // ============================================
-// v1.6.2 HOTFIX:
-//   🔧 Adsterra stats.json — NOW attempts per-link data via group_by param
-//      Tries: smartlink / smartlink_id / placement / placement_id / link
-//      If Adsterra supports any of these, per-link stats work correctly
-//   🔧 Caching added — bulk stats fetched once, reused for all links (fast)
-//   🔧 Debug endpoint now shows which group_by works
-//   🔧 Graceful fallback — if per-link not supported, returns 0 with clear log
-//
-// v1.6.1 + v1.6.0 features preserved:
-//   ✅ start_date / finish_date (correct params)
-//   ✅ 60/40 revenue split
-//   ✅ Min withdrawal $15
-//   ✅ Withdrawal windows (14,15,29,30)
-//   ✅ Max 10 links per user
-//   ✅ Admin earnings overview
+// v1.6.4 CHANGES:
+//   ✅ /api/user/stats — each link now includes `url` (for copy feature)
+//   ✅ /api/user/stats — removed `clicks` and `cpm` from metrics (not shown to user)
+//   ✅ Goals — only `revenue`, `impressions`, `rpm` allowed (clicks/cpm removed)
+//   ✅ All v1.6.2 features preserved
 // ============================================
 
 const express = require('express');
@@ -40,11 +30,15 @@ const ADMIN_SHARE = 1 - USER_SHARE;
 const MIN_WITHDRAWAL = parseFloat(MIN_WITHDRAWAL_USD) || 15;
 const WITHDRAWAL_WINDOW_DATES = [14, 15, 29, 30];
 
+// v1.6.4: Only these goal types allowed (clicks/cpm removed)
+const VALID_GOAL_TYPES = ['revenue', 'impressions', 'rpm'];
+
 console.log('✅ Environment loaded:');
 console.log(`  USER_SHARE: ${(USER_SHARE * 100).toFixed(0)}% | ADMIN_SHARE: ${(ADMIN_SHARE * 100).toFixed(0)}%`);
 console.log(`  MIN_WITHDRAWAL: $${MIN_WITHDRAWAL}`);
 console.log(`  WITHDRAWAL_WINDOWS: days ${WITHDRAWAL_WINDOW_DATES.join(', ')}`);
 console.log(`  MAX_LINKS_PER_USER: ${MAX_LINKS}`);
+console.log(`  VALID_GOAL_TYPES: ${VALID_GOAL_TYPES.join(', ')}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
     console.error('❌ Missing required env vars. Exiting.');
@@ -153,7 +147,7 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA HELPERS (v1.6.2)
+// 6. ADSTERRA HELPERS
 // -----------------------------
 const extractItems = (data) => {
     if (!data) return [];
@@ -233,17 +227,10 @@ const fetchSmartlinksFromAdsterra = async () => {
     }
 };
 
-// -----------------------------
-// 6B. NEW v1.6.2: PER-LINK STATS WITH GROUP_BY + CACHE
-// -----------------------------
+// Cache for bulk placement stats (60s TTL)
 let _placementCache = { key: null, data: null, ts: 0, method: null };
-const PLACEMENT_CACHE_TTL = 60000; // 60 seconds
+const PLACEMENT_CACHE_TTL = 60000;
 
-/**
- * Fetch bulk stats with per-placement breakdown.
- * Tries multiple group_by values. Caches successful result for 60s.
- * Returns: { items, method } or null if per-link grouping not supported.
- */
 const fetchBulkPlacementStats = async (dateFrom, dateTo) => {
     const cacheKey = `${dateFrom}:${dateTo}`;
     if (_placementCache.key === cacheKey && Date.now() - _placementCache.ts < PLACEMENT_CACHE_TTL) {
@@ -254,45 +241,34 @@ const fetchBulkPlacementStats = async (dateFrom, dateTo) => {
     const url = `${baseUrl}stats.json`;
     const headers = { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' };
 
-    // Try each group_by value
-    const groupByOptions = ['smartlink', 'smartlink_id', 'placement', 'placement_id', 'link', 'link_id'];
-
-    for (const groupBy of groupByOptions) {
-        try {
-            const resp = await axios.get(url, {
-                params: { start_date: dateFrom, finish_date: dateTo, group_by: groupBy },
-                headers, timeout: 15000,
-            });
-            const items = extractItems(resp.data);
-
-            if (items.length > 0) {
-                // Check if items have per-link ID field
-                const idFields = ['smartlink_id', 'smartlink', 'placement_id', 'placement', 'link_id', 'link'];
-                const hasIdField = items.some(item => idFields.some(f => item[f] !== undefined && item[f] !== null));
-
-                if (hasIdField) {
-                    console.log(`✅ Per-link stats WORKING via group_by=${groupBy} (${items.length} items)`);
-                    _placementCache = { key: cacheKey, data: items, ts: Date.now(), method: groupBy };
-                    return { items, method: groupBy };
-                }
+    try {
+        const resp = await axios.get(url, {
+            params: { start_date: dateFrom, finish_date: dateTo, group_by: 'placement' },
+            headers, timeout: 15000,
+        });
+        const items = extractItems(resp.data);
+        if (items.length > 0) {
+            const hasIdField = items.some(item =>
+                item.placement !== undefined || item.placement_id !== undefined ||
+                item.smartlink_id !== undefined || item.smartlink !== undefined
+            );
+            if (hasIdField) {
+                _placementCache = { key: cacheKey, data: items, ts: Date.now(), method: 'placement' };
+                return { items, method: 'placement' };
             }
-        } catch (err) {
-            // Try next option — most group_by values will return 422 "not expected"
         }
+    } catch (err) {
+        // fall through
     }
 
-    console.log(`⚠️ Adsterra does NOT support per-link grouping for date range ${dateFrom} to ${dateTo}. Aggregate only.`);
     _placementCache = { key: cacheKey, data: null, ts: Date.now(), method: null };
     return null;
 };
 
-/**
- * Extract per-link stats from bulk items using any ID field.
- */
 const extractPerLinkStats = (items, targetId) => {
     if (!Array.isArray(items)) return null;
     const target = String(targetId);
-    const idFields = ['smartlink_id', 'smartlink', 'placement_id', 'placement', 'link_id', 'link'];
+    const idFields = ['placement', 'placement_id', 'smartlink_id', 'smartlink', 'link_id', 'link'];
 
     const matches = items.filter(item => {
         return idFields.some(f => item[f] !== undefined && item[f] !== null && String(item[f]) === target);
@@ -300,7 +276,6 @@ const extractPerLinkStats = (items, targetId) => {
 
     if (matches.length === 0) return null;
 
-    // Aggregate all matching rows (could be multiple days)
     let imp = 0, clk = 0, rev = 0, cpmSum = 0, rpmSum = 0, cnt = 0;
     matches.forEach(item => {
         const m = mapStatsFields(item);
@@ -317,17 +292,11 @@ const extractPerLinkStats = (items, targetId) => {
     };
 };
 
-/**
- * v1.6.2: Main stats fetcher.
- * - If smartlinkId NULL → aggregate total
- * - If smartlinkId provided → try per-link via grouping; fall back to null (caller distributes)
- */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
     const url = `${baseUrl}stats.json`;
     const headers = { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' };
 
-    // Aggregate only
     if (!smartlinkId) {
         try {
             const resp = await axios.get(url, {
@@ -347,16 +316,12 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
         }
     }
 
-    // Per-link — try grouping
     const bulk = await fetchBulkPlacementStats(dateFrom, dateTo);
     if (bulk && bulk.items) {
         const match = extractPerLinkStats(bulk.items, smartlinkId);
-        if (match) return match;
-        // Link has no data in this range
-        return zeroStats();
+        return match || zeroStats();
     }
 
-    // Per-link grouping not supported — return null as signal to caller
     return null;
 };
 
@@ -365,7 +330,7 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
 // -----------------------------
 app.get('/api/test', (req, res) => {
     res.json({
-        status: 'ok', version: '1.6.2',
+        status: 'ok', version: '1.6.4',
         message: 'CORS working! Backend reachable.',
         timestamp: new Date().toISOString(),
     });
@@ -382,7 +347,7 @@ app.get('/api/test-adsterra', async (req, res) => {
         const items = extractItems(response.data);
         const sample = items.slice(0, 5).map(i => ({
             id: i.id || i.smart_link_id || i.placement_id,
-            title: i.title, alias: i.alias,
+            title: i.title, alias: i.alias, url: i.url,
         }));
         res.json({ success: true, count: items.length, sample });
     } catch (error) {
@@ -390,10 +355,6 @@ app.get('/api/test-adsterra', async (req, res) => {
     }
 });
 
-/**
- * v1.6.2: Comprehensive stats test.
- * Shows: aggregate data, per-link grouping support, and all group_by attempts.
- */
 app.get('/api/test-adsterra-stats', async (req, res) => {
     const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
     const url = `${baseUrl}stats.json`;
@@ -402,80 +363,22 @@ app.get('/api/test-adsterra-stats', async (req, res) => {
     const today = new Date();
     const dateTo = req.query.to || today.toISOString().split('T')[0];
     const dateFrom = req.query.from || new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const testSmartlinkId = req.query.smartlink_id || null;
 
-    const results = {
-        apiVersion: 'v1.6.2',
-        dateRange: { from: dateFrom, to: dateTo },
-        aggregate: null,
-        groupByTests: {},
-        perLinkResult: null,
-    };
+    const results = { apiVersion: 'v1.6.4', dateRange: { from: dateFrom, to: dateTo } };
 
-    // Aggregate
     try {
         const resp = await axios.get(url, {
-            params: { start_date: dateFrom, finish_date: dateTo },
+            params: { start_date: dateFrom, finish_date: dateTo, group_by: 'placement' },
             headers, timeout: 15000,
         });
         const items = extractItems(resp.data);
-        results.aggregate = {
+        results.placementGroupBy = {
             status: resp.status,
             itemCount: items.length,
-            total: aggregateItems(items),
-            sample: items.slice(0, 5),
-            itemFields: items[0] ? Object.keys(items[0]) : [],
+            sample: items.slice(0, 3),
         };
     } catch (err) {
-        results.aggregate = { error: err.message, response: err.response?.data };
-    }
-
-    // Test each group_by
-    for (const groupBy of ['smartlink', 'smartlink_id', 'placement', 'placement_id', 'link', 'link_id']) {
-        try {
-            const resp = await axios.get(url, {
-                params: { start_date: dateFrom, finish_date: dateTo, group_by: groupBy },
-                headers, timeout: 15000,
-            });
-            const items = extractItems(resp.data);
-            const idFields = ['smartlink_id', 'smartlink', 'placement_id', 'placement', 'link_id', 'link'];
-            const hasIds = items.length > 0 && items.some(i => idFields.some(f => i[f] !== undefined));
-            results.groupByTests[groupBy] = {
-                status: resp.status,
-                itemCount: items.length,
-                hasIdFields: hasIds,
-                itemFields: items[0] ? Object.keys(items[0]) : [],
-                sample: items.slice(0, 2),
-            };
-        } catch (err) {
-            results.groupByTests[groupBy] = {
-                error: err.response?.data?.message || err.message,
-                status: err.response?.status,
-            };
-        }
-    }
-
-    // Test per-link if requested
-    if (testSmartlinkId) {
-        try {
-            const bulk = await fetchBulkPlacementStats(dateFrom, dateTo);
-            if (bulk) {
-                const match = extractPerLinkStats(bulk.items, testSmartlinkId);
-                results.perLinkResult = {
-                    searchingFor: testSmartlinkId,
-                    method: bulk.method,
-                    found: !!match,
-                    data: match || null,
-                };
-            } else {
-                results.perLinkResult = {
-                    searchingFor: testSmartlinkId,
-                    error: 'Per-link grouping NOT supported by Adsterra API',
-                };
-            }
-        } catch (err) {
-            results.perLinkResult = { error: err.message };
-        }
+        results.placementGroupBy = { error: err.message, response: err.response?.data };
     }
 
     res.json({ success: true, ...results });
@@ -531,7 +434,7 @@ app.post('/api/auth/user-signup', async (req, res) => {
         await db.collection('users').doc(userRecord.uid).set({
             email, displayName: name, role: 'user',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
+            permissions: { impressions: true, clicks: false, cpm: false, rpm: true, revenue: true },
             smartlinkId: null, currencyPreference: 'USD', linkCount: 0,
         });
         res.status(201).json({ message: 'User account created successfully! You can now log in.', uid: userRecord.uid });
@@ -622,7 +525,7 @@ app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
         await db.collection('users').doc(userRecord.uid).set({
             email, role: 'user',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
+            permissions: { impressions: true, clicks: false, cpm: false, rpm: true, revenue: true },
             smartlinkId: null, currencyPreference: 'USD', linkCount: 0,
         });
         res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
@@ -818,14 +721,8 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 11. AGGREGATED STATS (v1.6.2 — handles per-link + fallback)
+// 11. AGGREGATED STATS
 // -----------------------------
-/**
- * Get aggregated stats for a user.
- * - Tries per-link grouping first
- * - If per-link NOT available → falls back to even distribution of aggregate total
- *   (approximate but shows realistic numbers instead of hardcoded 0)
- */
 const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) => {
     const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
     if (assignmentsSnapshot.empty) return zeroStats();
@@ -833,13 +730,11 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) 
     const linkIds = [];
     assignmentsSnapshot.forEach(doc => linkIds.push(doc.data().smartlinkId));
 
-    // Try per-link grouping first
     const bulk = await fetchBulkPlacementStats(dateFrom, dateTo);
 
     let imp = 0, clk = 0, rev = 0, cpmSum = 0, rpmSum = 0, cnt = 0;
 
     if (bulk && bulk.items) {
-        // Per-link data available — sum up user's links
         linkIds.forEach(id => {
             const match = extractPerLinkStats(bulk.items, id);
             if (match) {
@@ -852,11 +747,7 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) 
             }
         });
     } else {
-        // Fallback: aggregate total + distribute proportionally by total link count
-        console.log(`⚠️ Per-link not available. Distributing aggregate total proportionally.`);
         const totalStats = await fetchStatsFromAdsterra(dateFrom, dateTo, null);
-
-        // Get total link count across ALL users
         const allAssignmentsSnapshot = await db.collection('assignments').get();
         const totalLinks = allAssignmentsSnapshot.size;
         const userLinks = linkIds.length;
@@ -881,7 +772,7 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) 
 };
 
 // -----------------------------
-// 12. USER STATS + ANALYTICS (v1.6.2)
+// 12. USER STATS (v1.6.4 — url added, clicks/cpm removed)
 // -----------------------------
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
@@ -893,16 +784,24 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
         const permissions = userData.permissions || {};
         const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
 
+        // Fetch Adsterra links to get URLs (v1.6.4 — for copy feature)
+        let urlMap = {};
+        try {
+            const adsterraLinks = await fetchSmartlinksFromAdsterra();
+            adsterraLinks.forEach(l => { urlMap[l.id] = l.url || ''; });
+        } catch (urlErr) {
+            console.warn('⚠️ Could not fetch URLs for copy feature:', urlErr.message);
+        }
+
         const smartlinks = [];
         if (!assignmentsSnapshot.empty) {
             const today = new Date().toISOString().split('T')[0];
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-            // Try per-link grouping
             const bulk = await fetchBulkPlacementStats(sevenDaysAgo, today);
 
             if (bulk && bulk.items) {
-                // Per-link mode — real per-link stats
+                // Per-link mode
                 assignmentsSnapshot.forEach(doc => {
                     const data = doc.data();
                     const match = extractPerLinkStats(bulk.items, data.smartlinkId);
@@ -910,12 +809,12 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
                     smartlinks.push({
                         id: data.smartlinkId,
                         name: data.smartlinkName || data.smartlinkId,
+                        url: urlMap[data.smartlinkId] || '',   // v1.6.4 — URL for copy
                         metrics: {
                             impressions: stats.impressions,
-                            clicks: stats.clicks,
-                            cpm: stats.cpm * USER_SHARE,
                             rpm: stats.rpm * USER_SHARE,
                             revenue: stats.revenue * USER_SHARE,
+                            // v1.6.4 — clicks and cpm REMOVED (not shown to user)
                         },
                     });
                 });
@@ -924,24 +823,19 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
                 const totalStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, null);
                 const allAssignments = await db.collection('assignments').get();
                 const totalLinks = allAssignments.size;
-                const userLinks = assignmentsSnapshot.size;
                 const perLinkShare = totalLinks > 0 ? 1 / totalLinks : 0;
-
-                const perLinkImp = (totalStats.impressions || 0) * perLinkShare;
-                const perLinkClk = (totalStats.clicks || 0) * perLinkShare;
-                const perLinkRev = (totalStats.revenue || 0) * perLinkShare;
 
                 assignmentsSnapshot.forEach(doc => {
                     const data = doc.data();
                     smartlinks.push({
                         id: data.smartlinkId,
                         name: data.smartlinkName || data.smartlinkId,
+                        url: urlMap[data.smartlinkId] || '',   // v1.6.4
                         metrics: {
-                            impressions: Math.round(perLinkImp),
-                            clicks: Math.round(perLinkClk),
-                            cpm: (totalStats.cpm || 0) * USER_SHARE,
+                            impressions: Math.round((totalStats.impressions || 0) * perLinkShare),
                             rpm: (totalStats.rpm || 0) * USER_SHARE,
-                            revenue: perLinkRev * USER_SHARE,
+                            revenue: (totalStats.revenue || 0) * perLinkShare * USER_SHARE,
+                            // clicks and cpm removed
                         },
                     });
                 });
@@ -958,6 +852,7 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     }
 });
 
+// v1.6.4: Analytics endpoint kept (used by admin-side analytics page if any)
 app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
     try {
         const currentUid = req.user.uid;
@@ -984,7 +879,6 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
                     if (match) totalClicks += match.clicks;
                 });
             } else {
-                // Fallback
                 const totalStats = await fetchStatsFromAdsterra(today, tomorrow, null);
                 const allAssignments = await db.collection('assignments').get();
                 const totalLinks = allAssignments.size;
@@ -1004,7 +898,7 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 13. USER GOALS
+// 13. USER GOALS (v1.6.4 — only revenue, impressions, rpm)
 // -----------------------------
 app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
     try {
@@ -1020,9 +914,9 @@ app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
             let current = 0;
             switch (data.type) {
                 case 'revenue': current = currentStats.revenue || 0; break;
-                case 'clicks': current = currentStats.clicks || 0; break;
                 case 'impressions': current = currentStats.impressions || 0; break;
                 case 'rpm': current = currentStats.rpm || 0; break;
+                // v1.6.4 — 'clicks' removed
             }
             const target = data.target || 1;
             const progress = target > 0 ? Math.min((current / target) * 100, 100) : 0;
@@ -1046,7 +940,12 @@ app.post('/api/user/goals', authMiddleware('user'), async (req, res) => {
         const uid = req.user.uid;
         const { type, target, deadline } = req.body;
         if (!type || !target || target <= 0) return res.status(400).json({ message: 'Invalid goal' });
-        if (!['revenue', 'clicks', 'impressions', 'rpm'].includes(type)) return res.status(400).json({ message: 'Invalid type' });
+        // v1.6.4 — only revenue, impressions, rpm
+        if (!VALID_GOAL_TYPES.includes(type)) {
+            return res.status(400).json({
+                message: `Invalid goal type. Allowed: ${VALID_GOAL_TYPES.join(', ')}`,
+            });
+        }
         const docRef = await db.collection('users').doc(uid).collection('goals').add({
             type, target: parseFloat(target), deadline: deadline || null,
             title: type.charAt(0).toUpperCase() + type.slice(1),
@@ -1064,6 +963,12 @@ app.put('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
         const { goalId } = req.params;
         const { type, target, deadline } = req.body;
         if (!goalId || !type || !target || target <= 0) return res.status(400).json({ message: 'Missing fields' });
+        // v1.6.4 — only revenue, impressions, rpm
+        if (!VALID_GOAL_TYPES.includes(type)) {
+            return res.status(400).json({
+                message: `Invalid goal type. Allowed: ${VALID_GOAL_TYPES.join(', ')}`,
+            });
+        }
         const goalRef = db.collection('users').doc(req.user.uid).collection('goals').doc(goalId);
         const goalDoc = await goalRef.get();
         if (!goalDoc.exists) return res.status(404).json({ message: 'Goal not found' });
@@ -1150,7 +1055,6 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
     let rawTotal = 0;
 
     if (bulk && bulk.items) {
-        // Per-link mode
         assignmentsSnapshot.forEach(doc => {
             const data = doc.data();
             const match = extractPerLinkStats(bulk.items, data.smartlinkId);
@@ -1162,9 +1066,7 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
                 rawRevenue: round2(stats.revenue),
                 sharedRevenue: round2(stats.revenue * USER_SHARE),
                 margin: round2(stats.revenue * ADMIN_SHARE),
-                clicks: stats.clicks,
-                impressions: stats.impressions,
-                cpm: round2(stats.cpm),
+                impressions: stats.impressions,   // v1.6.4 — clicks removed
                 rpm: round2(stats.rpm),
                 claimedBySelf: data.claimedBySelf || false,
                 assignedAt: safeDateToISO(data.assignedAt),
@@ -1172,11 +1074,9 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
             rawTotal += stats.revenue;
         });
     } else {
-        // Fallback — distribute proportionally
         const totalStats = await fetchStatsFromAdsterra(fromDate, today, null);
         const allAssignments = await db.collection('assignments').get();
         const totalLinks = allAssignments.size;
-        const userLinks = assignmentsSnapshot.size;
         const perLinkRev = totalLinks > 0 ? (totalStats.revenue || 0) / totalLinks : 0;
 
         assignmentsSnapshot.forEach(doc => {
@@ -1188,9 +1088,8 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
                 rawRevenue: round2(perLinkRev),
                 sharedRevenue: round2(perLinkRev * USER_SHARE),
                 margin: round2(perLinkRev * ADMIN_SHARE),
-                clicks: 0,
                 impressions: 0,
-                cpm: 0, rpm: 0,
+                rpm: 0,
                 claimedBySelf: data.claimedBySelf || false,
                 assignedAt: safeDateToISO(data.assignedAt),
             });
@@ -1262,7 +1161,7 @@ app.get('/api/admin/user-balance/:uid', authMiddleware('admin'), async (req, res
 });
 
 // -----------------------------
-// 16. ADMIN — EARNINGS OVERVIEW (v1.6.2)
+// 16. ADMIN — EARNINGS OVERVIEW
 // -----------------------------
 app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res) => {
     try {
@@ -1283,12 +1182,10 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
             };
         });
 
-        // Try per-link first
         const bulk = await fetchBulkPlacementStats(fromDate, today);
         let links = [];
 
         if (bulk && bulk.items) {
-            // Per-link mode
             assignmentsSnapshot.forEach(doc => {
                 const d = doc.data();
                 const match = extractPerLinkStats(bulk.items, d.smartlinkId);
@@ -1302,17 +1199,14 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
                     rawRevenue: round2(stats.revenue),
                     sharedRevenue: round2(stats.revenue * USER_SHARE),
                     margin: round2(stats.revenue * ADMIN_SHARE),
-                    clicks: stats.clicks,
-                    impressions: stats.impressions,
+                    impressions: stats.impressions,  // v1.6.4 — clicks removed
                 });
             });
         } else {
-            // Fallback — distribute total proportional to link count
             const totalStats = await fetchStatsFromAdsterra(fromDate, today, null);
             const totalLinks = assignmentsSnapshot.size;
             const perLinkRev = totalLinks > 0 ? (totalStats.revenue || 0) / totalLinks : 0;
             const perLinkImp = totalLinks > 0 ? (totalStats.impressions || 0) / totalLinks : 0;
-            const perLinkClk = totalLinks > 0 ? (totalStats.clicks || 0) / totalLinks : 0;
 
             assignmentsSnapshot.forEach(doc => {
                 const d = doc.data();
@@ -1325,7 +1219,6 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
                     rawRevenue: round2(perLinkRev),
                     sharedRevenue: round2(perLinkRev * USER_SHARE),
                     margin: round2(perLinkRev * ADMIN_SHARE),
-                    clicks: Math.round(perLinkClk),
                     impressions: Math.round(perLinkImp),
                 });
             });
@@ -1930,23 +1823,25 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
 // -----------------------------
 app.get('/api', (req, res) => {
     res.json({
-        name: 'Lunar Metrics API', version: '1.6.2', status: 'operational',
+        name: 'Lunar Metrics API', version: '1.6.4', status: 'operational',
         split: { userShare: USER_SHARE, adminShare: ADMIN_SHARE },
         limits: {
             maxLinksPerUser: MAX_LINKS,
             minWithdrawalUsd: MIN_WITHDRAWAL,
             withdrawalWindowDates: WITHDRAWAL_WINDOW_DATES,
             balanceLookbackDays: BALANCE_PERIOD_DAYS,
+            validGoalTypes: VALID_GOAL_TYPES,
         },
         features: [
             'auth', 'adsterra-smartlinks', 'admin-users', 'admin-links',
-            'user-stats', 'user-analytics', 'goals', 'leaderboard', 'chart-data',
+            'user-stats-with-url', 'goals-revenue-impressions-rpm',
+            'leaderboard', 'chart-data',
             'self-service-claiming', 'claim-limit-10',
             'withdrawals', 'withdrawal-windows-14-15-29-30', 'min-withdrawal-15',
             'live-chat', 'balance', 'balance-validated-withdrawals',
             'crypto-split-methods', 'admin-user-balance-breakdown',
             'admin-earnings-overview', 'revenue-split-60-40',
-            'adsterra-stats-v1.6.2-group-by-tested',
+            'adsterra-stats-v1.6.4',
         ],
         timestamp: new Date().toISOString(),
     });
