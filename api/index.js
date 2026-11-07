@@ -1,10 +1,13 @@
 // ============================================
-// LUNAR METRICS · MASTER BACKEND (v1.6.5)
+// LUNAR METRICS · MASTER BACKEND (v1.7.0)
 // ============================================
-// v1.6.5 CHANGES (only metrics fix):
-//   ✅ User metrics: impressions + cpm + revenue (clicks & rpm removed)
-//   ✅ Goal types: revenue + impressions + cpm (clicks & rpm removed)
-//   ✅ Everywhere else unchanged from v1.6.4
+// v1.7.0 CHANGES:
+//   🔒 FIX #3: Withdrawal double-spend race condition (transaction + lock doc)
+//   ⚡ FIX #4: Chart data — 90D timeout (group_by=day single call + 60s cache)
+//   🕵️ SCRUB: "Adsterra" word hidden from user-facing endpoints/errors/features
+//   ➕ NEW: User profile management (name, email, password, payout methods save)
+//   🗑️ REMOVED: /api/test-adsterra, /api/test-adsterra-stats diagnostic endpoints
+//   ✅ Everything else identical to v1.6.5
 // ============================================
 
 const express = require('express');
@@ -29,8 +32,11 @@ const ADMIN_SHARE = 1 - USER_SHARE;
 const MIN_WITHDRAWAL = parseFloat(MIN_WITHDRAWAL_USD) || 15;
 const WITHDRAWAL_WINDOW_DATES = [14, 15, 29, 30];
 
-// v1.6.5: Only these goal types allowed (clicks & rpm removed, cpm added)
+// v1.7.0: Only these goal types allowed
 const VALID_GOAL_TYPES = ['revenue', 'impressions', 'cpm'];
+
+// v1.7.0: Payout methods allowed for save/autofill
+const PAYOUT_METHODS = ['jazzcash', 'easypaisa', 'bank', 'binance_uid', 'usdt_bep20'];
 
 console.log('✅ Environment loaded:');
 console.log(`  USER_SHARE: ${(USER_SHARE * 100).toFixed(0)}% | ADMIN_SHARE: ${(ADMIN_SHARE * 100).toFixed(0)}%`);
@@ -38,6 +44,7 @@ console.log(`  MIN_WITHDRAWAL: $${MIN_WITHDRAWAL}`);
 console.log(`  WITHDRAWAL_WINDOWS: days ${WITHDRAWAL_WINDOW_DATES.join(', ')}`);
 console.log(`  MAX_LINKS_PER_USER: ${MAX_LINKS}`);
 console.log(`  VALID_GOAL_TYPES: ${VALID_GOAL_TYPES.join(', ')}`);
+console.log(`  BACKEND_VERSION: 1.7.0`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
     console.error('❌ Missing required env vars. Exiting.');
@@ -146,7 +153,7 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. ADSTERRA HELPERS
+// 6. SMARTLINKS / STATS HELPERS (renamed from Adsterra internal names)
 // -----------------------------
 const extractItems = (data) => {
     if (!data) return [];
@@ -201,7 +208,7 @@ const fetchSmartlinksFromAdsterra = async () => {
             timeout: 15000,
         });
         const items = extractItems(response.data);
-        if (items.length === 0) throw new Error('No links returned from Adsterra');
+        if (items.length === 0) throw new Error('No links returned');
 
         return items.map(item => {
             let name = item.alias || item.name || item.title || item.label || item.smartlink_name || '';
@@ -221,8 +228,8 @@ const fetchSmartlinksFromAdsterra = async () => {
             };
         });
     } catch (error) {
-        console.error('❌ Adsterra links error:', error.response?.data || error.message);
-        throw new Error(`Failed to fetch links: ${error.response?.data?.message || error.message}`);
+        console.error('❌ Smartlinks fetch error:', error.response?.data || error.message);
+        throw new Error(`Failed to fetch smartlinks: ${error.response?.data?.message || error.message}`);
     }
 };
 
@@ -310,7 +317,7 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
             }
             return zeroStats();
         } catch (error) {
-            console.error(`❌ Aggregate stats error:`, error.response?.data || error.message);
+            console.error(`❌ Stats fetch error:`, error.response?.data || error.message);
             return zeroStats();
         }
     }
@@ -324,63 +331,45 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     return null;
 };
 
-// -----------------------------
-// 7. DIAGNOSTIC ENDPOINTS
-// -----------------------------
-app.get('/api/test', (req, res) => {
-    res.json({
-        status: 'ok', version: '1.6.5',
-        message: 'CORS working! Backend reachable.',
-        timestamp: new Date().toISOString(),
-    });
-});
+// v1.7.0: Daily grouped cache (60s TTL) — replaces slow per-day loops
+let _dailyCache = { key: null, data: null, ts: 0 };
+const DAILY_CACHE_TTL = 60000;
 
-app.get('/api/test-adsterra', async (req, res) => {
-    try {
-        const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
-        const url = `${baseUrl}smart-links.json`;
-        const response = await axios.get(url, {
-            headers: { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' },
-            timeout: 15000,
-        });
-        const items = extractItems(response.data);
-        const sample = items.slice(0, 5).map(i => ({
-            id: i.id || i.smart_link_id || i.placement_id,
-            title: i.title, alias: i.alias, url: i.url,
-        }));
-        res.json({ success: true, count: items.length, sample });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.response?.data || error.message });
+const fetchDailyTotalsGrouped = async (dateFrom, dateTo) => {
+    const cacheKey = `${dateFrom}:${dateTo}`;
+    if (_dailyCache.key === cacheKey && Date.now() - _dailyCache.ts < DAILY_CACHE_TTL) {
+        return _dailyCache.data;
     }
-});
 
-app.get('/api/test-adsterra-stats', async (req, res) => {
     const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
     const url = `${baseUrl}stats.json`;
     const headers = { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' };
 
-    const today = new Date();
-    const dateTo = req.query.to || today.toISOString().split('T')[0];
-    const dateFrom = req.query.from || new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-
-    const results = { apiVersion: 'v1.6.5', dateRange: { from: dateFrom, to: dateTo } };
-
     try {
         const resp = await axios.get(url, {
-            params: { start_date: dateFrom, finish_date: dateTo, group_by: 'placement' },
+            params: { start_date: dateFrom, finish_date: dateTo, group_by: 'day' },
             headers, timeout: 15000,
         });
         const items = extractItems(resp.data);
-        results.placementGroupBy = {
-            status: resp.status,
-            itemCount: items.length,
-            sample: items.slice(0, 3),
-        };
+        _dailyCache = { key: cacheKey, data: items, ts: Date.now() };
+        return items;
     } catch (err) {
-        results.placementGroupBy = { error: err.message, response: err.response?.data };
+        console.error('❌ Daily totals fetch error:', err.response?.data || err.message);
+        _dailyCache = { key: cacheKey, data: null, ts: Date.now() };
+        return null;
     }
+};
 
-    res.json({ success: true, ...results });
+// -----------------------------
+// 7. DIAGNOSTIC ENDPOINTS
+// (v1.7.0: adsterra-specific ones removed)
+// -----------------------------
+app.get('/api/test', (req, res) => {
+    res.json({
+        status: 'ok', version: '1.7.0',
+        message: 'CORS working! Backend reachable.',
+        timestamp: new Date().toISOString(),
+    });
 });
 
 // -----------------------------
@@ -435,6 +424,7 @@ app.post('/api/auth/user-signup', async (req, res) => {
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             permissions: { impressions: true, clicks: false, cpm: true, rpm: false, revenue: true },
             smartlinkId: null, currencyPreference: 'USD', linkCount: 0,
+            payoutMethods: {},
         });
         res.status(201).json({ message: 'User account created successfully! You can now log in.', uid: userRecord.uid });
     } catch (error) {
@@ -447,11 +437,186 @@ app.post('/api/auth/user-signup', async (req, res) => {
 });
 
 // -----------------------------
+// 8.5. USER PROFILE MANAGEMENT (v1.7.0 NEW)
+// -----------------------------
+app.get('/api/user/profile', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const userDoc = await db.collection('users').doc(uid).get();
+        if (!userDoc.exists) return res.status(404).json({ message: 'User not found' });
+        const data = userDoc.data();
+        res.json({
+            uid,
+            email: data.email,
+            displayName: data.displayName || '',
+            createdAt: safeDateToISO(data.createdAt),
+            currencyPreference: data.currencyPreference || 'USD',
+            payoutMethods: data.payoutMethods || {},
+        });
+    } catch (error) {
+        console.error('Get profile error:', error);
+        res.status(500).json({ message: 'Failed to fetch profile' });
+    }
+});
+
+app.patch('/api/user/profile', authMiddleware('user'), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { displayName, payoutMethods, currencyPreference } = req.body;
+        const updates = {};
+
+        if (displayName !== undefined) {
+            const name = String(displayName).trim();
+            if (!name) return res.status(400).json({ message: 'Name cannot be empty' });
+            if (name.length > 100) return res.status(400).json({ message: 'Name too long (max 100)' });
+            updates.displayName = name;
+        }
+
+        if (currencyPreference !== undefined) {
+            if (!['USD', 'PKR'].includes(currencyPreference)) {
+                return res.status(400).json({ message: 'Invalid currency' });
+            }
+            updates.currencyPreference = currencyPreference;
+        }
+
+        if (payoutMethods !== undefined) {
+            if (typeof payoutMethods !== 'object' || payoutMethods === null || Array.isArray(payoutMethods)) {
+                return res.status(400).json({ message: 'Invalid payout methods' });
+            }
+            const sanitized = {};
+            PAYOUT_METHODS.forEach(m => {
+                const src = payoutMethods[m];
+                if (src && typeof src === 'object' && !Array.isArray(src)) {
+                    const entry = {};
+                    ['accountName', 'accountNumber', 'bankName', 'iban', 'binanceUid', 'usdtAddress'].forEach(f => {
+                        if (src[f] !== undefined && src[f] !== null && String(src[f]).trim()) {
+                            entry[f] = String(src[f]).trim().slice(0, 150);
+                        }
+                    });
+                    if (Object.keys(entry).length > 0) sanitized[m] = entry;
+                }
+            });
+            updates.payoutMethods = sanitized;
+        }
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ message: 'No valid fields to update' });
+        }
+
+        await db.collection('users').doc(uid).update(updates);
+        res.json({ message: 'Profile updated', updated: Object.keys(updates) });
+    } catch (error) {
+        console.error('Profile update error:', error);
+        res.status(500).json({ message: 'Failed to update profile' });
+    }
+});
+
+app.post('/api/user/change-password', authMiddleware('user'), async (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ message: 'Current and new password required' });
+        }
+        if (newPassword.length < 6) {
+            return res.status(400).json({ message: 'New password must be at least 6 characters' });
+        }
+        if (currentPassword === newPassword) {
+            return res.status(400).json({ message: 'New password must be different from current' });
+        }
+
+        try {
+            await firebaseAuth(req.user.email, currentPassword);
+        } catch (authErr) {
+            return res.status(401).json({ message: 'Current password is incorrect' });
+        }
+
+        await admin.auth().updateUser(req.user.uid, { password: newPassword });
+        res.json({ message: 'Password changed successfully. Please log in again on other devices.' });
+    } catch (error) {
+        console.error('Change password error:', error);
+        res.status(500).json({ message: 'Failed to change password' });
+    }
+});
+
+app.post('/api/user/change-email', authMiddleware('user'), async (req, res) => {
+    try {
+        const { newEmail, password } = req.body;
+        if (!newEmail || !password) {
+            return res.status(400).json({ message: 'New email and current password required' });
+        }
+        const email = String(newEmail).trim().toLowerCase();
+        if (!email.includes('@') || email.length < 5) {
+            return res.status(400).json({ message: 'Invalid email address' });
+        }
+        if (email === req.user.email.toLowerCase()) {
+            return res.status(400).json({ message: 'New email must be different from current' });
+        }
+
+        try {
+            await firebaseAuth(req.user.email, password);
+        } catch (authErr) {
+            return res.status(401).json({ message: 'Password is incorrect' });
+        }
+
+        try {
+            const existing = await admin.auth().getUserByEmail(email);
+            if (existing.uid !== req.user.uid) {
+                return res.status(400).json({ message: 'Email already in use by another account' });
+            }
+        } catch (err) {
+            if (err.code !== 'auth/user-not-found') {
+                return res.status(500).json({ message: 'Failed to verify email availability' });
+            }
+        }
+
+        const oldEmail = req.user.email;
+
+        // 1. Update Firebase auth
+        await admin.auth().updateUser(req.user.uid, { email });
+
+        // 2. Update Firestore user doc
+        await db.collection('users').doc(req.user.uid).update({ email });
+
+        // 3. Update assignments, chat messages, withdrawal requests (chunked)
+        const collectionUpdates = [];
+        const colls = [
+            { name: 'assignments', field: 'userEmail' },
+            { name: 'chatMessages', field: 'userEmail' },
+            { name: 'withdrawalRequests', field: 'userEmail' },
+        ];
+        for (const c of colls) {
+            try {
+                const snap = await db.collection(c.name).where(c.field, '==', oldEmail).get();
+                snap.forEach(doc => collectionUpdates.push({
+                    ref: doc.ref,
+                    data: { [c.field]: email },
+                }));
+            } catch (e) { /* collection may not exist */ }
+        }
+
+        for (let i = 0; i < collectionUpdates.length; i += 400) {
+            const batch = db.batch();
+            collectionUpdates.slice(i, i + 400).forEach(u => batch.update(u.ref, u.data));
+            await batch.commit();
+        }
+
+        res.json({
+            message: 'Email changed successfully. Please log in again with your new email.',
+            requiresRelogin: true,
+            newEmail: email,
+        });
+    } catch (error) {
+        console.error('Change email error:', error);
+        res.status(500).json({ message: 'Failed to change email' });
+    }
+});
+
+// -----------------------------
 // 9. ADMIN — USERS + LINKS
 // -----------------------------
 app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
     try {
-        const adsterraLinks = await fetchSmartlinksFromAdsterra();
+        const smartlinks = await fetchSmartlinksFromAdsterra();
         const assignmentsSnapshot = await db.collection('assignments').get();
         const assignments = {};
         assignmentsSnapshot.forEach(doc => {
@@ -461,7 +626,7 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
                 smartlinkName: data.smartlinkName, claimedBySelf: data.claimedBySelf || false,
             };
         });
-        const smartlinks = adsterraLinks.map(link => {
+        const smartlinksList = smartlinks.map(link => {
             const assigned = assignments[link.id];
             return {
                 ...link,
@@ -471,7 +636,7 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
                 claimedBySelf: assigned ? assigned.claimedBySelf : false,
             };
         });
-        res.json(smartlinks);
+        res.json(smartlinksList);
     } catch (error) {
         console.error('Smartlinks fetch error:', error.message);
         res.status(500).json({ message: 'Failed to fetch links', error: error.message });
@@ -526,6 +691,7 @@ app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             permissions: { impressions: true, clicks: false, cpm: true, rpm: false, revenue: true },
             smartlinkId: null, currencyPreference: 'USD', linkCount: 0,
+            payoutMethods: {},
         });
         res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
     } catch (error) {
@@ -626,9 +792,9 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
 
 app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
     try {
-        const adsterraLinks = await fetchSmartlinksFromAdsterra();
+        const smartlinks = await fetchSmartlinksFromAdsterra();
         const nameMap = {};
-        adsterraLinks.forEach(link => { nameMap[link.id] = link.name; });
+        smartlinks.forEach(link => { nameMap[link.id] = link.name; });
         const assignmentsSnapshot = await db.collection('assignments').get();
         let updated = 0, notFound = 0;
         const batch = db.batch();
@@ -652,13 +818,13 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
 app.get('/api/user/available-links', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
-        const adsterraLinks = await fetchSmartlinksFromAdsterra();
+        const smartlinks = await fetchSmartlinksFromAdsterra();
         const assignmentsSnapshot = await db.collection('assignments').get();
         const claimedIds = new Set();
         assignmentsSnapshot.forEach(doc => claimedIds.add(doc.data().smartlinkId));
         const userAssignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
         const claimedCount = userAssignmentsSnapshot.size;
-        const available = adsterraLinks
+        const available = smartlinks
             .filter(link => !claimedIds.has(String(link.id)))
             .map(link => ({ id: link.id, name: link.name, url: link.url }));
         res.json({
@@ -678,9 +844,9 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
         const email = req.user.email;
         const { smartlinkId } = req.body;
         if (!smartlinkId) return res.status(400).json({ message: 'Smartlink ID required' });
-        const adsterraLinks = await fetchSmartlinksFromAdsterra();
-        const link = adsterraLinks.find(l => String(l.id) === String(smartlinkId));
-        if (!link) return res.status(404).json({ message: 'Link not found in Adsterra pool.' });
+        const smartlinks = await fetchSmartlinksFromAdsterra();
+        const link = smartlinks.find(l => String(l.id) === String(smartlinkId));
+        if (!link) return res.status(404).json({ message: 'Link not found in pool.' });
         await db.runTransaction(async (transaction) => {
             const userAssignmentsQuery = db.collection('assignments').where('userId', '==', uid);
             const userAssignmentsSnapshot = await transaction.get(userAssignmentsQuery);
@@ -771,7 +937,7 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) 
 };
 
 // -----------------------------
-// 12. USER STATS (v1.6.5 — impressions + cpm + revenue only)
+// 12. USER STATS
 // -----------------------------
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
@@ -785,13 +951,13 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
 
         let urlMap = {};
         try {
-            const adsterraLinks = await fetchSmartlinksFromAdsterra();
-            adsterraLinks.forEach(l => { urlMap[l.id] = l.url || ''; });
+            const smartlinks = await fetchSmartlinksFromAdsterra();
+            smartlinks.forEach(l => { urlMap[l.id] = l.url || ''; });
         } catch (urlErr) {
             console.warn('⚠️ Could not fetch URLs for copy feature:', urlErr.message);
         }
 
-        const smartlinks = [];
+        const smartlinksArr = [];
         if (!assignmentsSnapshot.empty) {
             const today = new Date().toISOString().split('T')[0];
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -803,15 +969,14 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
                     const data = doc.data();
                     const match = extractPerLinkStats(bulk.items, data.smartlinkId);
                     const stats = match || zeroStats();
-                    smartlinks.push({
+                    smartlinksArr.push({
                         id: data.smartlinkId,
                         name: data.smartlinkName || data.smartlinkId,
                         url: urlMap[data.smartlinkId] || '',
                         metrics: {
                             impressions: stats.impressions,
-                            cpm: stats.cpm * USER_SHARE,     // v1.6.5 — cpm instead of rpm
+                            cpm: stats.cpm * USER_SHARE,
                             revenue: stats.revenue * USER_SHARE,
-                            // clicks and rpm removed
                         },
                     });
                 });
@@ -823,13 +988,13 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
 
                 assignmentsSnapshot.forEach(doc => {
                     const data = doc.data();
-                    smartlinks.push({
+                    smartlinksArr.push({
                         id: data.smartlinkId,
                         name: data.smartlinkName || data.smartlinkId,
                         url: urlMap[data.smartlinkId] || '',
                         metrics: {
                             impressions: Math.round((totalStats.impressions || 0) * perLinkShare),
-                            cpm: (totalStats.cpm || 0) * USER_SHARE,     // v1.6.5
+                            cpm: (totalStats.cpm || 0) * USER_SHARE,
                             revenue: (totalStats.revenue || 0) * perLinkShare * USER_SHARE,
                         },
                     });
@@ -838,8 +1003,8 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
         }
 
         res.json({
-            userEmail: userData.email, permissions, smartlinks,
-            linkCount: smartlinks.length, maxLinks: MAX_LINKS,
+            userEmail: userData.email, permissions, smartlinks: smartlinksArr,
+            linkCount: smartlinksArr.length, maxLinks: MAX_LINKS,
         });
     } catch (error) {
         console.error('User stats error:', error);
@@ -892,7 +1057,7 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 13. USER GOALS (v1.6.5 — only revenue, impressions, cpm)
+// 13. USER GOALS
 // -----------------------------
 app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
     try {
@@ -909,8 +1074,7 @@ app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
             switch (data.type) {
                 case 'revenue': current = currentStats.revenue || 0; break;
                 case 'impressions': current = currentStats.impressions || 0; break;
-                case 'cpm': current = currentStats.cpm || 0; break;   // v1.6.5 — cpm instead of rpm
-                // clicks and rpm removed
+                case 'cpm': current = currentStats.cpm || 0; break;
             }
             const target = data.target || 1;
             const progress = target > 0 ? Math.min((current / target) * 100, 100) : 0;
@@ -934,7 +1098,6 @@ app.post('/api/user/goals', authMiddleware('user'), async (req, res) => {
         const uid = req.user.uid;
         const { type, target, deadline } = req.body;
         if (!type || !target || target <= 0) return res.status(400).json({ message: 'Invalid goal' });
-        // v1.6.5 — only revenue, impressions, cpm
         if (!VALID_GOAL_TYPES.includes(type)) {
             return res.status(400).json({
                 message: `Invalid goal type. Allowed: ${VALID_GOAL_TYPES.join(', ')}`,
@@ -957,7 +1120,6 @@ app.put('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
         const { goalId } = req.params;
         const { type, target, deadline } = req.body;
         if (!goalId || !type || !target || target <= 0) return res.status(400).json({ message: 'Missing fields' });
-        // v1.6.5 — only revenue, impressions, cpm
         if (!VALID_GOAL_TYPES.includes(type)) {
             return res.status(400).json({
                 message: `Invalid goal type. Allowed: ${VALID_GOAL_TYPES.join(', ')}`,
@@ -1061,7 +1223,7 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
                 sharedRevenue: round2(stats.revenue * USER_SHARE),
                 margin: round2(stats.revenue * ADMIN_SHARE),
                 impressions: stats.impressions,
-                cpm: round2(stats.cpm),   // v1.6.5 — cpm instead of rpm
+                cpm: round2(stats.cpm),
                 claimedBySelf: data.claimedBySelf || false,
                 assignedAt: safeDateToISO(data.assignedAt),
             });
@@ -1194,7 +1356,7 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
                     sharedRevenue: round2(stats.revenue * USER_SHARE),
                     margin: round2(stats.revenue * ADMIN_SHARE),
                     impressions: stats.impressions,
-                    cpm: round2(stats.cpm),   // v1.6.5 — cpm instead of rpm
+                    cpm: round2(stats.cpm),
                 });
             });
         } else {
@@ -1297,7 +1459,7 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
 });
 
 // -----------------------------
-// 17. USER — WITHDRAWAL REQUESTS
+// 17. USER — WITHDRAWAL REQUESTS (v1.7.0: race-fix)
 // -----------------------------
 const WITHDRAWAL_METHODS = ['jazzcash', 'easypaisa', 'bank', 'binance_uid', 'usdt_bep20'];
 
@@ -1339,55 +1501,100 @@ app.post('/api/user/withdrawal-request', authMiddleware('user'), async (req, res
         }
         const validationError = validateWithdrawalPayload(req.body);
         if (validationError) return res.status(400).json({ message: validationError });
+
         const userDoc = await db.collection('users').doc(uid).get();
         if (!userDoc.exists) return res.status(404).json({ message: 'User not found.' });
         const userData = userDoc.data();
         const requestedAmount = parseFloat(req.body.amount);
+
+        // Step 1: Compute totalEarned (external stats — cannot be in transaction)
         const balance = await getUserBalance(uid);
-        if (balance.availableBalance <= 0) {
+        const totalEarned = balance.totalEarned || 0;
+
+        if (totalEarned <= 0) {
             return res.status(400).json({
-                message: `You have no available balance to withdraw.`,
-                availableBalance: balance.availableBalance,
+                message: 'You have no earnings to withdraw.',
+                availableBalance: 0,
             });
         }
-        if (requestedAmount > balance.availableBalance) {
-            return res.status(400).json({
-                message: `Insufficient balance. Available: $${balance.availableBalance.toFixed(2)}.`,
-                availableBalance: balance.availableBalance, requestedAmount,
+
+        // Step 2: Atomic transaction — lock + verify + create
+        const lockRef = db.collection('withdrawalLocks').doc(uid);
+        const requestRef = db.collection('withdrawalRequests').doc();
+        let freshAvailable = 0;
+
+        try {
+            await db.runTransaction(async (transaction) => {
+                // Lock read+write forces serialization
+                await transaction.get(lockRef);
+
+                const wQuery = db.collection('withdrawalRequests').where('userId', '==', uid);
+                const wSnap = await transaction.get(wQuery);
+
+                let totalWithdrawn = 0, totalPending = 0, totalProcessing = 0;
+                wSnap.forEach(doc => {
+                    const d = doc.data();
+                    const amt = parseFloat(d.amount) || 0;
+                    if (d.status === 'approved') totalWithdrawn += amt;
+                    else if (d.status === 'pending') totalPending += amt;
+                    else if (d.status === 'processing') totalProcessing += amt;
+                });
+
+                const lockedIn = totalPending + totalProcessing;
+                freshAvailable = Math.max(0, totalEarned - totalWithdrawn - lockedIn);
+
+                if (requestedAmount > freshAvailable) {
+                    const err = new Error('INSUFFICIENT_BALANCE');
+                    err.available = freshAvailable;
+                    throw err;
+                }
+
+                const { method, accountName, accountNumber, iban, binanceUid, usdtAddress } = req.body;
+                const requestData = {
+                    userId: uid, userEmail: email,
+                    userName: userData.displayName || email.split('@')[0] || 'User',
+                    amount: requestedAmount, method,
+                    status: 'pending', rejectionReason: null,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    processedBy: null, processedAt: null,
+                    balanceAtRequest: freshAvailable,
+                };
+                if (method === 'jazzcash' || method === 'easypaisa') {
+                    requestData.accountName = String(accountName).trim();
+                    requestData.accountNumber = String(accountNumber).trim();
+                } else if (method === 'bank') {
+                    requestData.accountName = String(accountName).trim();
+                    requestData.iban = String(iban).trim();
+                    if (accountNumber) requestData.accountNumber = String(accountNumber).trim();
+                    if (req.body.bankName) requestData.bankName = String(req.body.bankName).trim();
+                } else if (method === 'binance_uid') {
+                    requestData.binanceUid = String(binanceUid).trim();
+                    requestData.cryptoType = 'binance_internal';
+                } else if (method === 'usdt_bep20') {
+                    requestData.usdtAddress = String(usdtAddress).trim();
+                    requestData.cryptoType = 'usdt_bep20_onchain';
+                    requestData.cryptoNetwork = 'BEP20';
+                }
+
+                transaction.set(requestRef, requestData);
+                transaction.set(lockRef, { lastRequestAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
             });
+        } catch (txErr) {
+            if (txErr.message === 'INSUFFICIENT_BALANCE') {
+                return res.status(400).json({
+                    message: `Insufficient balance. Available: $${(txErr.available || 0).toFixed(2)}.`,
+                    availableBalance: round2(txErr.available || 0),
+                    requestedAmount,
+                });
+            }
+            throw txErr;
         }
-        const { method, accountName, accountNumber, iban, binanceUid, usdtAddress } = req.body;
-        const requestData = {
-            userId: uid, userEmail: email,
-            userName: userData.displayName || email.split('@')[0] || 'User',
-            amount: parseFloat(req.body.amount), method,
-            status: 'pending', rejectionReason: null,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            processedBy: null, processedAt: null,
-            balanceAtRequest: balance.availableBalance,
-        };
-        if (method === 'jazzcash' || method === 'easypaisa') {
-            requestData.accountName = String(accountName).trim();
-            requestData.accountNumber = String(accountNumber).trim();
-        } else if (method === 'bank') {
-            requestData.accountName = String(accountName).trim();
-            requestData.iban = String(iban).trim();
-            if (accountNumber) requestData.accountNumber = String(accountNumber).trim();
-            if (req.body.bankName) requestData.bankName = String(req.body.bankName).trim();
-        } else if (method === 'binance_uid') {
-            requestData.binanceUid = String(binanceUid).trim();
-            requestData.cryptoType = 'binance_internal';
-        } else if (method === 'usdt_bep20') {
-            requestData.usdtAddress = String(usdtAddress).trim();
-            requestData.cryptoType = 'usdt_bep20_onchain';
-            requestData.cryptoNetwork = 'BEP20';
-        }
-        const docRef = await db.collection('withdrawalRequests').add(requestData);
+
         res.status(201).json({
             message: 'Withdrawal request submitted successfully! Admin will review it soon.',
-            requestId: docRef.id,
-            newAvailableBalance: round2(balance.availableBalance - requestedAmount),
+            requestId: requestRef.id,
+            newAvailableBalance: round2(freshAvailable - requestedAmount),
         });
     } catch (error) {
         console.error('Create withdrawal error:', error);
@@ -1725,52 +1932,101 @@ app.get('/api/leaderboard', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 22. CHART DATA
+// 22. CHART DATA (v1.7.0: single-call daily aggregation)
 // -----------------------------
-const fetchDailyStatsForLink = async (smartlinkId, days = 7) => {
-    const dailyData = [];
-    const now = new Date();
-    for (let i = days - 1; i >= 0; i--) {
-        const d = new Date(now);
-        d.setDate(d.getDate() - i);
-        const dateStr = d.toISOString().split('T')[0];
-        const nextDay = new Date(d);
-        nextDay.setDate(nextDay.getDate() + 1);
-        const nextDateStr = nextDay.toISOString().split('T')[0];
-        const stats = await fetchStatsFromAdsterra(dateStr, nextDateStr, smartlinkId);
-        dailyData.push({
-            date: dateStr,
-            impressions: (stats && stats.impressions) || 0,
-            clicks: (stats && stats.clicks) || 0,
-            revenue: (stats && stats.revenue) || 0,
-        });
-    }
-    return dailyData;
-};
-
 const aggregateDailyStats = async (linkIds, days) => {
     const dailyMap = {};
     const now = new Date();
+    const dates = [];
     for (let i = days - 1; i >= 0; i--) {
         const d = new Date(now);
         d.setDate(d.getDate() - i);
         const dateStr = d.toISOString().split('T')[0];
+        dates.push(dateStr);
         dailyMap[dateStr] = { date: dateStr, impressions: 0, clicks: 0, revenue: 0 };
     }
-    await Promise.all(linkIds.map(async (linkId) => {
-        try {
-            const dailyStats = await fetchDailyStatsForLink(linkId, days);
-            dailyStats.forEach(day => {
-                if (dailyMap[day.date]) {
-                    dailyMap[day.date].impressions += day.impressions;
-                    dailyMap[day.date].clicks += day.clicks;
-                    dailyMap[day.date].revenue += day.revenue;
+
+    if (linkIds.length === 0) return dates.map(date => dailyMap[date]);
+
+    const fromDate = dates[0];
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const toDate = tomorrow.toISOString().split('T')[0];
+
+    // ONE call for daily totals (group_by=day)
+    const dailyItems = await fetchDailyTotalsGrouped(fromDate, toDate);
+
+    if (dailyItems && dailyItems.length > 0) {
+        // ONE cached call for per-link share calculation
+        const bulk = await fetchBulkPlacementStats(fromDate, toDate);
+
+        let linkTotalImp = 0, linkTotalClk = 0, linkTotalRev = 0;
+        const linkShares = {};
+        if (bulk && bulk.items) {
+            linkIds.forEach(id => {
+                const m = extractPerLinkStats(bulk.items, id);
+                if (m) {
+                    linkShares[id] = m;
+                    linkTotalImp += m.impressions;
+                    linkTotalClk += m.clicks;
+                    linkTotalRev += m.revenue;
                 }
             });
-        } catch (err) { /* silent */ }
+        }
+
+        dailyItems.forEach(item => {
+            const dateKey = String(item.date || item.day || '').substring(0, 10);
+            if (!dailyMap[dateKey]) return;
+            const m = mapStatsFields(item);
+
+            if (linkIds.length === 1 && linkShares[linkIds[0]]) {
+                // Single link — no distribution
+                dailyMap[dateKey].impressions += m.impressions;
+                dailyMap[dateKey].clicks += m.clicks;
+                dailyMap[dateKey].revenue += m.revenue;
+            } else if (linkTotalImp > 0 || linkTotalClk > 0 || linkTotalRev > 0) {
+                // Proportional distribution by link share
+                const evenShare = 1 / linkIds.length;
+                linkIds.forEach(id => {
+                    const s = linkShares[id] || zeroStats();
+                    const impShare = linkTotalImp > 0 ? s.impressions / linkTotalImp : evenShare;
+                    const clkShare = linkTotalClk > 0 ? s.clicks / linkTotalClk : evenShare;
+                    const revShare = linkTotalRev > 0 ? s.revenue / linkTotalRev : evenShare;
+                    dailyMap[dateKey].impressions += m.impressions * impShare;
+                    dailyMap[dateKey].clicks += m.clicks * clkShare;
+                    dailyMap[dateKey].revenue += m.revenue * revShare;
+                });
+            } else {
+                // No per-link data — even split
+                dailyMap[dateKey].impressions += m.impressions;
+                dailyMap[dateKey].clicks += m.clicks;
+                dailyMap[dateKey].revenue += m.revenue;
+            }
+        });
+    } else {
+        // Fallback: bulk placement total distributed evenly across days
+        const bulk = await fetchBulkPlacementStats(fromDate, toDate);
+        if (bulk && bulk.items) {
+            const dayCount = dates.length;
+            linkIds.forEach(id => {
+                const m = extractPerLinkStats(bulk.items, id);
+                if (m) {
+                    dates.forEach(date => {
+                        dailyMap[date].impressions += m.impressions / dayCount;
+                        dailyMap[date].clicks += m.clicks / dayCount;
+                        dailyMap[date].revenue += m.revenue / dayCount;
+                    });
+                }
+            });
+        }
+    }
+
+    return dates.map(date => ({
+        date,
+        impressions: Math.round(dailyMap[date].impressions),
+        clicks: Math.round(dailyMap[date].clicks),
+        revenue: round2(dailyMap[date].revenue),
     }));
-    const sortedDates = Object.keys(dailyMap).sort();
-    return sortedDates.map(date => dailyMap[date]);
 };
 
 app.get('/api/admin/chart-data', authMiddleware('admin'), async (req, res) => {
@@ -1819,7 +2075,7 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
 // -----------------------------
 app.get('/api', (req, res) => {
     res.json({
-        name: 'Lunar Metrics API', version: '1.6.5', status: 'operational',
+        name: 'Lunar Metrics API', version: '1.7.0', status: 'operational',
         split: { userShare: USER_SHARE, adminShare: ADMIN_SHARE },
         limits: {
             maxLinksPerUser: MAX_LINKS,
@@ -1830,15 +2086,17 @@ app.get('/api', (req, res) => {
         },
         metricsExposed: ['impressions', 'cpm', 'revenue'],
         features: [
-            'auth', 'adsterra-smartlinks', 'admin-users', 'admin-links',
+            'auth', 'smartlinks', 'admin-users', 'admin-links',
             'user-stats-imp-cpm-revenue', 'goals-revenue-impressions-cpm',
-            'leaderboard', 'chart-data',
+            'leaderboard', 'chart-data-cached-daily',
             'self-service-claiming', 'claim-limit-10',
             'withdrawals', 'withdrawal-windows-14-15-29-30', 'min-withdrawal-15',
+            'withdrawal-race-safe-transactions',
             'live-chat', 'balance', 'balance-validated-withdrawals',
             'crypto-split-methods', 'admin-user-balance-breakdown',
             'admin-earnings-overview', 'revenue-split-60-40',
-            'adsterra-stats-v1.6.5',
+            'user-profile', 'change-password', 'change-email', 'payout-methods-saved',
+            'stats-v1.7.0',
         ],
         timestamp: new Date().toISOString(),
     });
