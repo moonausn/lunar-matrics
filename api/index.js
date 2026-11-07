@@ -1,11 +1,10 @@
 // ============================================
-// LUNAR METRICS · MASTER BACKEND (v1.6.4)
+// LUNAR METRICS · MASTER BACKEND (v1.6.5)
 // ============================================
-// v1.6.4 CHANGES:
-//   ✅ /api/user/stats — each link now includes `url` (for copy feature)
-//   ✅ /api/user/stats — removed `clicks` and `cpm` from metrics (not shown to user)
-//   ✅ Goals — only `revenue`, `impressions`, `rpm` allowed (clicks/cpm removed)
-//   ✅ All v1.6.2 features preserved
+// v1.6.5 CHANGES (only metrics fix):
+//   ✅ User metrics: impressions + cpm + revenue (clicks & rpm removed)
+//   ✅ Goal types: revenue + impressions + cpm (clicks & rpm removed)
+//   ✅ Everywhere else unchanged from v1.6.4
 // ============================================
 
 const express = require('express');
@@ -30,8 +29,8 @@ const ADMIN_SHARE = 1 - USER_SHARE;
 const MIN_WITHDRAWAL = parseFloat(MIN_WITHDRAWAL_USD) || 15;
 const WITHDRAWAL_WINDOW_DATES = [14, 15, 29, 30];
 
-// v1.6.4: Only these goal types allowed (clicks/cpm removed)
-const VALID_GOAL_TYPES = ['revenue', 'impressions', 'rpm'];
+// v1.6.5: Only these goal types allowed (clicks & rpm removed, cpm added)
+const VALID_GOAL_TYPES = ['revenue', 'impressions', 'cpm'];
 
 console.log('✅ Environment loaded:');
 console.log(`  USER_SHARE: ${(USER_SHARE * 100).toFixed(0)}% | ADMIN_SHARE: ${(ADMIN_SHARE * 100).toFixed(0)}%`);
@@ -330,7 +329,7 @@ const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
 // -----------------------------
 app.get('/api/test', (req, res) => {
     res.json({
-        status: 'ok', version: '1.6.4',
+        status: 'ok', version: '1.6.5',
         message: 'CORS working! Backend reachable.',
         timestamp: new Date().toISOString(),
     });
@@ -364,7 +363,7 @@ app.get('/api/test-adsterra-stats', async (req, res) => {
     const dateTo = req.query.to || today.toISOString().split('T')[0];
     const dateFrom = req.query.from || new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-    const results = { apiVersion: 'v1.6.4', dateRange: { from: dateFrom, to: dateTo } };
+    const results = { apiVersion: 'v1.6.5', dateRange: { from: dateFrom, to: dateTo } };
 
     try {
         const resp = await axios.get(url, {
@@ -434,7 +433,7 @@ app.post('/api/auth/user-signup', async (req, res) => {
         await db.collection('users').doc(userRecord.uid).set({
             email, displayName: name, role: 'user',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            permissions: { impressions: true, clicks: false, cpm: false, rpm: true, revenue: true },
+            permissions: { impressions: true, clicks: false, cpm: true, rpm: false, revenue: true },
             smartlinkId: null, currencyPreference: 'USD', linkCount: 0,
         });
         res.status(201).json({ message: 'User account created successfully! You can now log in.', uid: userRecord.uid });
@@ -525,7 +524,7 @@ app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
         await db.collection('users').doc(userRecord.uid).set({
             email, role: 'user',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            permissions: { impressions: true, clicks: false, cpm: false, rpm: true, revenue: true },
+            permissions: { impressions: true, clicks: false, cpm: true, rpm: false, revenue: true },
             smartlinkId: null, currencyPreference: 'USD', linkCount: 0,
         });
         res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
@@ -772,7 +771,7 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) 
 };
 
 // -----------------------------
-// 12. USER STATS (v1.6.4 — url added, clicks/cpm removed)
+// 12. USER STATS (v1.6.5 — impressions + cpm + revenue only)
 // -----------------------------
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
@@ -784,7 +783,6 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
         const permissions = userData.permissions || {};
         const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
 
-        // Fetch Adsterra links to get URLs (v1.6.4 — for copy feature)
         let urlMap = {};
         try {
             const adsterraLinks = await fetchSmartlinksFromAdsterra();
@@ -801,7 +799,6 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
             const bulk = await fetchBulkPlacementStats(sevenDaysAgo, today);
 
             if (bulk && bulk.items) {
-                // Per-link mode
                 assignmentsSnapshot.forEach(doc => {
                     const data = doc.data();
                     const match = extractPerLinkStats(bulk.items, data.smartlinkId);
@@ -809,17 +806,16 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
                     smartlinks.push({
                         id: data.smartlinkId,
                         name: data.smartlinkName || data.smartlinkId,
-                        url: urlMap[data.smartlinkId] || '',   // v1.6.4 — URL for copy
+                        url: urlMap[data.smartlinkId] || '',
                         metrics: {
                             impressions: stats.impressions,
-                            rpm: stats.rpm * USER_SHARE,
+                            cpm: stats.cpm * USER_SHARE,     // v1.6.5 — cpm instead of rpm
                             revenue: stats.revenue * USER_SHARE,
-                            // v1.6.4 — clicks and cpm REMOVED (not shown to user)
+                            // clicks and rpm removed
                         },
                     });
                 });
             } else {
-                // Fallback — distribute aggregate proportionally
                 const totalStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, null);
                 const allAssignments = await db.collection('assignments').get();
                 const totalLinks = allAssignments.size;
@@ -830,12 +826,11 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
                     smartlinks.push({
                         id: data.smartlinkId,
                         name: data.smartlinkName || data.smartlinkId,
-                        url: urlMap[data.smartlinkId] || '',   // v1.6.4
+                        url: urlMap[data.smartlinkId] || '',
                         metrics: {
                             impressions: Math.round((totalStats.impressions || 0) * perLinkShare),
-                            rpm: (totalStats.rpm || 0) * USER_SHARE,
+                            cpm: (totalStats.cpm || 0) * USER_SHARE,     // v1.6.5
                             revenue: (totalStats.revenue || 0) * perLinkShare * USER_SHARE,
-                            // clicks and cpm removed
                         },
                     });
                 });
@@ -852,7 +847,6 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     }
 });
 
-// v1.6.4: Analytics endpoint kept (used by admin-side analytics page if any)
 app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
     try {
         const currentUid = req.user.uid;
@@ -898,7 +892,7 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 13. USER GOALS (v1.6.4 — only revenue, impressions, rpm)
+// 13. USER GOALS (v1.6.5 — only revenue, impressions, cpm)
 // -----------------------------
 app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
     try {
@@ -915,8 +909,8 @@ app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
             switch (data.type) {
                 case 'revenue': current = currentStats.revenue || 0; break;
                 case 'impressions': current = currentStats.impressions || 0; break;
-                case 'rpm': current = currentStats.rpm || 0; break;
-                // v1.6.4 — 'clicks' removed
+                case 'cpm': current = currentStats.cpm || 0; break;   // v1.6.5 — cpm instead of rpm
+                // clicks and rpm removed
             }
             const target = data.target || 1;
             const progress = target > 0 ? Math.min((current / target) * 100, 100) : 0;
@@ -940,7 +934,7 @@ app.post('/api/user/goals', authMiddleware('user'), async (req, res) => {
         const uid = req.user.uid;
         const { type, target, deadline } = req.body;
         if (!type || !target || target <= 0) return res.status(400).json({ message: 'Invalid goal' });
-        // v1.6.4 — only revenue, impressions, rpm
+        // v1.6.5 — only revenue, impressions, cpm
         if (!VALID_GOAL_TYPES.includes(type)) {
             return res.status(400).json({
                 message: `Invalid goal type. Allowed: ${VALID_GOAL_TYPES.join(', ')}`,
@@ -963,7 +957,7 @@ app.put('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
         const { goalId } = req.params;
         const { type, target, deadline } = req.body;
         if (!goalId || !type || !target || target <= 0) return res.status(400).json({ message: 'Missing fields' });
-        // v1.6.4 — only revenue, impressions, rpm
+        // v1.6.5 — only revenue, impressions, cpm
         if (!VALID_GOAL_TYPES.includes(type)) {
             return res.status(400).json({
                 message: `Invalid goal type. Allowed: ${VALID_GOAL_TYPES.join(', ')}`,
@@ -1066,8 +1060,8 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
                 rawRevenue: round2(stats.revenue),
                 sharedRevenue: round2(stats.revenue * USER_SHARE),
                 margin: round2(stats.revenue * ADMIN_SHARE),
-                impressions: stats.impressions,   // v1.6.4 — clicks removed
-                rpm: round2(stats.rpm),
+                impressions: stats.impressions,
+                cpm: round2(stats.cpm),   // v1.6.5 — cpm instead of rpm
                 claimedBySelf: data.claimedBySelf || false,
                 assignedAt: safeDateToISO(data.assignedAt),
             });
@@ -1089,7 +1083,7 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
                 sharedRevenue: round2(perLinkRev * USER_SHARE),
                 margin: round2(perLinkRev * ADMIN_SHARE),
                 impressions: 0,
-                rpm: 0,
+                cpm: 0,
                 claimedBySelf: data.claimedBySelf || false,
                 assignedAt: safeDateToISO(data.assignedAt),
             });
@@ -1199,7 +1193,8 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
                     rawRevenue: round2(stats.revenue),
                     sharedRevenue: round2(stats.revenue * USER_SHARE),
                     margin: round2(stats.revenue * ADMIN_SHARE),
-                    impressions: stats.impressions,  // v1.6.4 — clicks removed
+                    impressions: stats.impressions,
+                    cpm: round2(stats.cpm),   // v1.6.5 — cpm instead of rpm
                 });
             });
         } else {
@@ -1220,6 +1215,7 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
                     sharedRevenue: round2(perLinkRev * USER_SHARE),
                     margin: round2(perLinkRev * ADMIN_SHARE),
                     impressions: Math.round(perLinkImp),
+                    cpm: 0,
                 });
             });
         }
@@ -1823,7 +1819,7 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
 // -----------------------------
 app.get('/api', (req, res) => {
     res.json({
-        name: 'Lunar Metrics API', version: '1.6.4', status: 'operational',
+        name: 'Lunar Metrics API', version: '1.6.5', status: 'operational',
         split: { userShare: USER_SHARE, adminShare: ADMIN_SHARE },
         limits: {
             maxLinksPerUser: MAX_LINKS,
@@ -1832,16 +1828,17 @@ app.get('/api', (req, res) => {
             balanceLookbackDays: BALANCE_PERIOD_DAYS,
             validGoalTypes: VALID_GOAL_TYPES,
         },
+        metricsExposed: ['impressions', 'cpm', 'revenue'],
         features: [
             'auth', 'adsterra-smartlinks', 'admin-users', 'admin-links',
-            'user-stats-with-url', 'goals-revenue-impressions-rpm',
+            'user-stats-imp-cpm-revenue', 'goals-revenue-impressions-cpm',
             'leaderboard', 'chart-data',
             'self-service-claiming', 'claim-limit-10',
             'withdrawals', 'withdrawal-windows-14-15-29-30', 'min-withdrawal-15',
             'live-chat', 'balance', 'balance-validated-withdrawals',
             'crypto-split-methods', 'admin-user-balance-breakdown',
             'admin-earnings-overview', 'revenue-split-60-40',
-            'adsterra-stats-v1.6.4',
+            'adsterra-stats-v1.6.5',
         ],
         timestamp: new Date().toISOString(),
     });
