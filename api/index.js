@@ -1,13 +1,14 @@
 // ============================================
 // LUNAR METRICS · MASTER BACKEND (v1.6.0)
 // ============================================
-// v1.5.0:
-//   - 10-link limit + admin user-balance with per-link breakdown
-//
-// v1.6.0 (NEW):
-//   🔗 /api/user/stats — smartlink `url` field added (for copy-to-clipboard)
-//   🔗 Admin user-balance breakdown — per-link `url` added
-//   ⚡ buildAdsterraUrlMap() — single Adsterra call for all URLs
+// v1.6.0 CHANGES:
+//   ✅ Stats API fix — 3 fallback strategies (smartlink_id → placement_id → bulk manual filter)
+//   ✅ 60/40 revenue split — USER_SHARE = 0.60 (user sees 60%, admin margin 40% hidden)
+//   ✅ Min withdrawal = $15
+//   ✅ Withdrawal windows — only 14/15 and 29/30 of each month
+//   ✅ Admin earnings overview — per-link actual vs shown vs margin + all user balances
+//   ✅ New debug endpoint /api/test-adsterra-stats
+//   ✅ Parallel Adsterra calls (Promise.all) for speed
 // ============================================
 
 const express = require('express');
@@ -17,7 +18,7 @@ const admin = require('firebase-admin');
 const jwt = require('jsonwebtoken');
 
 // -----------------------------
-// 1. ENVIRONMENT VARIABLES
+// 1. ENV + CONSTANTS
 // -----------------------------
 const {
     FIREBASE_WEB_API_KEY,
@@ -29,26 +30,33 @@ const {
     JWT_SECRET,
     BALANCE_LOOKBACK_DAYS,
     MAX_LINKS_PER_USER,
+    USER_SHARE_PERCENT,
+    MIN_WITHDRAWAL_USD,
 } = process.env;
+
+const BALANCE_PERIOD_DAYS = parseInt(BALANCE_LOOKBACK_DAYS) || 365;
+const MAX_LINKS = parseInt(MAX_LINKS_PER_USER) || 10;
+const USER_SHARE = (parseFloat(USER_SHARE_PERCENT) || 60) / 100;
+const ADMIN_SHARE = 1 - USER_SHARE;
+const MIN_WITHDRAWAL = parseFloat(MIN_WITHDRAWAL_USD) || 15;
+const WITHDRAWAL_WINDOW_DATES = [14, 15, 29, 30];
 
 console.log('✅ Environment loaded:');
 console.log(`  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID || '❌ MISSING'}`);
 console.log(`  ADSTERRA_API_KEY: ${ADSTERRA_API_KEY ? '✅ Set' : '❌ MISSING'}`);
-console.log(`  ADSTERRA_BASE_URL: ${ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/'}`);
 console.log(`  JWT_SECRET: ${JWT_SECRET ? '✅ Set' : '❌ MISSING'}`);
-console.log(`  BALANCE_LOOKBACK_DAYS: ${BALANCE_LOOKBACK_DAYS || '365 (default)'}`);
-console.log(`  MAX_LINKS_PER_USER: ${MAX_LINKS_PER_USER || '10 (default)'}`);
+console.log(`  USER_SHARE: ${(USER_SHARE * 100).toFixed(0)}% | ADMIN_SHARE: ${(ADMIN_SHARE * 100).toFixed(0)}%`);
+console.log(`  MIN_WITHDRAWAL: $${MIN_WITHDRAWAL}`);
+console.log(`  WITHDRAWAL_WINDOWS: days ${WITHDRAWAL_WINDOW_DATES.join(', ')}`);
+console.log(`  MAX_LINKS_PER_USER: ${MAX_LINKS}`);
 
 if (!FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY || !ADSTERRA_API_KEY || !JWT_SECRET) {
-    console.error('❌ Missing required environment variables. Exiting.');
+    console.error('❌ Missing required env vars. Exiting.');
     process.exit(1);
 }
 
-const BALANCE_PERIOD_DAYS = parseInt(BALANCE_LOOKBACK_DAYS) || 365;
-const MAX_LINKS = parseInt(MAX_LINKS_PER_USER) || 10;
-
 // -----------------------------
-// 2. FIREBASE ADMIN SDK INIT
+// 2. FIREBASE INIT
 // -----------------------------
 let db;
 try {
@@ -57,17 +65,17 @@ try {
         credential: admin.credential.cert({
             projectId: FIREBASE_PROJECT_ID,
             clientEmail: FIREBASE_CLIENT_EMAIL,
-            privateKey: privateKey,
+            privateKey,
         }),
     });
     db = admin.firestore();
-    console.log('✅ Firebase Admin SDK initialized successfully.');
+    console.log('✅ Firebase Admin SDK initialized.');
 } catch (error) {
-    console.error('❌ Firebase initialization failed:', error.message);
+    console.error('❌ Firebase init failed:', error.message);
 }
 
 // -----------------------------
-// 3. EXPRESS APP SETUP
+// 3. EXPRESS SETUP
 // -----------------------------
 const app = express();
 
@@ -97,52 +105,43 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
 
-// ----- DIAGNOSTIC ENDPOINT -----
-app.get('/api/test', (req, res) => {
-    res.json({
-        status: 'ok',
-        message: 'CORS is working! Backend is reachable.',
-        timestamp: new Date().toISOString(),
+// -----------------------------
+// 4. UTILITY HELPERS
+// -----------------------------
+const safeDateToISO = (ts) => ts ? ts.toDate().toISOString() : null;
+const getLimit = (req, def = 100, max = 500) => {
+    const n = parseInt(req.query.limit) || def;
+    return Math.min(Math.max(n, 1), max);
+};
+const round2 = (n) => Math.round((parseFloat(n) || 0) * 100) / 100;
+const zeroStats = () => ({ impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 });
+
+const isWithdrawalWindowOpen = (date = new Date()) => {
+    const day = date.getDate();
+    return WITHDRAWAL_WINDOW_DATES.includes(day);
+};
+
+const getNextWithdrawalWindow = (date = new Date()) => {
+    const day = date.getDate();
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    const candidates = [];
+
+    [0, 1].forEach(monthOffset => {
+        [14, 15, 29, 30].forEach(d => {
+            const candidate = new Date(year, month + monthOffset, d);
+            if (candidate.getDate() === d && candidate > date) {
+                candidates.push(candidate);
+            }
+        });
     });
-});
 
-// ----- ADSTERRA TEST ENDPOINT -----
-app.get('/api/test-adsterra', async (req, res) => {
-    try {
-        let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
-        if (!baseUrl.endsWith('/')) baseUrl += '/';
-        const url = `${baseUrl}smart-links.json`;
-
-        console.log('🔄 Testing Adsterra API with X-API-Key header:', url);
-        const response = await axios.get(url, {
-            headers: { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' },
-            timeout: 15000,
-        });
-
-        let items = [];
-        if (response.data?.data?.items && Array.isArray(response.data.data.items)) items = response.data.data.items;
-        else if (Array.isArray(response.data)) items = response.data;
-        else if (response.data?.items && Array.isArray(response.data.items)) items = response.data.items;
-
-        const sample = items.slice(0, 5).map(i => ({
-            id: i.id || i.smart_link_id || i.placement_id,
-            title: i.title, alias: i.alias, url: i.url, allKeys: Object.keys(i),
-        }));
-
-        res.json({ success: true, count: items.length, sample, fullData: response.data });
-    } catch (error) {
-        console.error('❌ Test Adsterra error:', error.response?.data || error.message);
-        res.status(500).json({
-            success: false,
-            error: error.response?.data || error.message,
-            status: error.response?.status,
-            message: 'Adsterra API call failed. Check your API key and base URL.',
-        });
-    }
-});
+    candidates.sort((a, b) => a - b);
+    return candidates[0] || null;
+};
 
 // -----------------------------
-// 4. AUTH MIDDLEWARE
+// 5. AUTH MIDDLEWARE
 // -----------------------------
 const authMiddleware = (requiredRole = null) => {
     return async (req, res, next) => {
@@ -163,9 +162,6 @@ const authMiddleware = (requiredRole = null) => {
     };
 };
 
-// -----------------------------
-// 5. FIREBASE REST HELPER
-// -----------------------------
 const firebaseAuth = async (email, password) => {
     const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
     const response = await axios.post(url, { email, password, returnSecureToken: true });
@@ -173,23 +169,159 @@ const firebaseAuth = async (email, password) => {
 };
 
 // -----------------------------
-// 6. SHARED UTILITIES
+// 6. DIAGNOSTIC ENDPOINTS
 // -----------------------------
-const safeDateToISO = (ts) => ts ? ts.toDate().toISOString() : null;
-const getLimit = (req, def = 100, max = 500) => {
-    const n = parseInt(req.query.limit) || def;
-    return Math.min(Math.max(n, 1), max);
+app.get('/api/test', (req, res) => {
+    res.json({
+        status: 'ok',
+        message: 'CORS is working! Backend is reachable.',
+        version: '1.6.0',
+        timestamp: new Date().toISOString(),
+    });
+});
+
+app.get('/api/test-adsterra', async (req, res) => {
+    try {
+        const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
+        const url = `${baseUrl}smart-links.json`;
+
+        const response = await axios.get(url, {
+            headers: { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' },
+            timeout: 15000,
+        });
+
+        const items = extractItems(response.data);
+        const sample = items.slice(0, 5).map(i => ({
+            id: i.id || i.smart_link_id || i.placement_id,
+            title: i.title, alias: i.alias, url: i.url,
+        }));
+
+        res.json({ success: true, count: items.length, sample });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.response?.data || error.message,
+            status: error.response?.status,
+        });
+    }
+});
+
+/**
+ * NEW v1.6.0: Debug endpoint for stats API
+ * Shows raw response from Adsterra stats.json with different params.
+ */
+app.get('/api/test-adsterra-stats', async (req, res) => {
+    const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
+    const url = `${baseUrl}stats.json`;
+    const headers = { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' };
+
+    const today = new Date();
+    const dateTo = req.query.to || today.toISOString().split('T')[0];
+    const dateFrom = req.query.from || new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const testSmartlinkId = req.query.smartlink_id || null;
+
+    const results = {
+        dateRange: { from: dateFrom, to: dateTo },
+        tests: {},
+    };
+
+    // Test 1: no filter (total)
+    try {
+        const resp = await axios.get(url, {
+            params: { from: dateFrom, to: dateTo },
+            headers, timeout: 15000,
+        });
+        results.tests.noFilter = {
+            status: resp.status,
+            itemCount: extractItems(resp.data).length,
+            sample: extractItems(resp.data).slice(0, 3),
+            rawShape: Array.isArray(resp.data) ? 'array' : (resp.data?.data ? 'nested-data' : 'object'),
+        };
+    } catch (err) {
+        results.tests.noFilter = { error: err.message, response: err.response?.data, status: err.response?.status };
+    }
+
+    // Test 2: with smartlink_id (if provided)
+    if (testSmartlinkId) {
+        for (const pk of ['smartlink_id', 'placement_id', 'id']) {
+            try {
+                const resp = await axios.get(url, {
+                    params: { from: dateFrom, to: dateTo, [pk]: testSmartlinkId },
+                    headers, timeout: 15000,
+                });
+                results.tests[pk] = {
+                    status: resp.status,
+                    itemCount: extractItems(resp.data).length,
+                    raw: resp.data,
+                };
+            } catch (err) {
+                results.tests[pk] = { error: err.message, response: err.response?.data, status: err.response?.status };
+            }
+        }
+    }
+
+    res.json({ success: true, ...results });
+});
+
+// -----------------------------
+// 7. ADSTERRA HELPERS
+// -----------------------------
+const extractItems = (data) => {
+    if (!data) return [];
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data.items)) return data.items;
+    if (data.data) {
+        if (Array.isArray(data.data)) return data.data;
+        if (Array.isArray(data.data.items)) return data.data.items;
+    }
+    if (Array.isArray(data.result)) return data.result;
+    return [];
 };
 
-// -----------------------------
-// 7. ADSTERRA API HELPERS
-// -----------------------------
-const fetchSmartlinksFromAdsterra = async () => {
-    let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
-    if (!baseUrl.endsWith('/')) baseUrl += '/';
-    const url = `${baseUrl}smart-links.json`;
+const mapStatsFields = (item) => {
+    if (!item || typeof item !== 'object') return zeroStats();
+    const rev = item.revenue ?? item.profit ?? item.amount ?? item.earning ?? item.total_revenue ?? 0;
+    const imp = item.impressions ?? item.impression ?? item.imp ?? 0;
+    const clk = item.clicks ?? item.click ?? item.clk ?? 0;
+    return {
+        impressions: parseFloat(imp) || 0,
+        clicks: parseFloat(clk) || 0,
+        cpm: parseFloat(item.cpm) || 0,
+        rpm: parseFloat(item.rpm) || 0,
+        revenue: parseFloat(rev) || 0,
+    };
+};
 
-    console.log(`🔄 Fetching real smartlinks from: ${url} using X-API-Key`);
+const findItemById = (items, id) => {
+    if (!Array.isArray(items)) return null;
+    const target = String(id);
+    return items.find(item =>
+        String(item.smart_link_id ?? item.placement_id ?? item.id ?? '') === target
+    ) || null;
+};
+
+const aggregateItems = (items) => {
+    if (!Array.isArray(items) || items.length === 0) return zeroStats();
+    let imp = 0, clk = 0, rev = 0, cpmSum = 0, rpmSum = 0, cnt = 0;
+    items.forEach(item => {
+        const m = mapStatsFields(item);
+        imp += m.impressions;
+        clk += m.clicks;
+        rev += m.revenue;
+        if (m.cpm) cpmSum += m.cpm;
+        if (m.rpm) rpmSum += m.rpm;
+        cnt++;
+    });
+    return {
+        impressions: imp, clicks: clk, revenue: rev,
+        cpm: cnt > 0 ? cpmSum / cnt : 0,
+        rpm: cnt > 0 ? rpmSum / cnt : 0,
+    };
+};
+
+const fetchSmartlinksFromAdsterra = async () => {
+    const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
+    const url = `${baseUrl}smart-links.json`;
 
     try {
         const response = await axios.get(url, {
@@ -197,16 +329,10 @@ const fetchSmartlinksFromAdsterra = async () => {
             timeout: 15000,
         });
 
-        if (response.status !== 200) throw new Error(`Adsterra returned status ${response.status}`);
+        const items = extractItems(response.data);
+        if (items.length === 0) throw new Error('No links returned from Adsterra');
 
-        let items = [];
-        if (response.data?.data?.items && Array.isArray(response.data.data.items)) items = response.data.data.items;
-        else if (Array.isArray(response.data)) items = response.data;
-        else if (response.data?.items && Array.isArray(response.data.items)) items = response.data.items;
-        else if (response.data?.result && Array.isArray(response.data.result)) items = response.data.result;
-        else throw new Error('Unexpected response structure from Adsterra');
-
-        const mapped = items.map(item => {
+        return items.map(item => {
             let name = item.alias || item.name || item.title || item.label || item.smartlink_name || '';
             if (!name) {
                 for (const key of Object.keys(item)) {
@@ -223,97 +349,82 @@ const fetchSmartlinksFromAdsterra = async () => {
                 url: item.url || '',
             };
         });
-
-        console.log(`✅ Fetched ${mapped.length} smartlinks`);
-        return mapped;
     } catch (error) {
-        console.error('❌ Adsterra API error:', error.response?.data || error.message);
-        throw new Error(`Failed to fetch real data from Adsterra: ${error.response?.data?.message || error.message}`);
+        console.error('❌ Adsterra links error:', error.response?.data || error.message);
+        throw new Error(`Failed to fetch links: ${error.response?.data?.message || error.message}`);
     }
 };
 
 /**
- * NEW v1.6.0 — Build a quick id → { name, url } map.
- * Single Adsterra call, so we can attach URL to any list of smartlinks.
- * Returns empty map on failure (graceful fallback).
+ * v1.6.0: Robust stats fetcher with 3 fallback strategies.
  */
-const buildAdsterraUrlMap = async () => {
-    const map = {};
-    try {
-        const links = await fetchSmartlinksFromAdsterra();
-        links.forEach(l => {
-            map[String(l.id)] = { name: l.name, url: l.url || '' };
-        });
-    } catch (err) {
-        console.warn('⚠️ buildAdsterraUrlMap failed (URLs will be empty):', err.message);
-    }
-    return map;
-};
-
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
-    try {
-        let baseUrl = ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/';
-        if (!baseUrl.endsWith('/')) baseUrl += '/';
-        const url = `${baseUrl}stats.json`;
+    const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
+    const url = `${baseUrl}stats.json`;
+    const headers = { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' };
 
-        const params = { from: dateFrom, to: dateTo };
-        if (smartlinkId) params.placement_id = smartlinkId;
-
-        const response = await axios.get(url, {
-            params,
-            headers: { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' },
-            timeout: 15000,
-        });
-
-        let statsData = response.data;
-        if (statsData.data?.items) statsData = statsData.data.items;
-
-        if (Array.isArray(statsData)) {
-            if (smartlinkId) {
-                const found = statsData.find(item =>
-                    (item.placement_id && item.placement_id == smartlinkId) ||
-                    (item.smartlink_id && item.smartlink_id == smartlinkId)
-                );
-                return found || {};
+    // No filter — return aggregate total
+    if (!smartlinkId) {
+        try {
+            const resp = await axios.get(url, {
+                params: { from: dateFrom, to: dateTo },
+                headers, timeout: 15000,
+            });
+            const items = extractItems(resp.data);
+            if (items.length > 0) return aggregateItems(items);
+            if (resp.data && typeof resp.data === 'object' && !Array.isArray(resp.data)) {
+                const direct = mapStatsFields(resp.data);
+                if (direct.revenue || direct.impressions) return direct;
             }
-            return statsData.length > 0 ? statsData[0] : {};
+        } catch (err) {
+            console.warn('Stats (total) failed:', err.message);
         }
-        return statsData || {};
-    } catch (error) {
-        console.error('Adsterra Stats fetch error:', error.message);
-        return { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 };
+        return zeroStats();
     }
-};
 
-const fetchDailyStatsForLink = async (smartlinkId, days = 7) => {
-    const dailyData = [];
-    const now = new Date();
-    for (let i = days - 1; i >= 0; i--) {
-        const d = new Date(now);
-        d.setDate(d.getDate() - i);
-        const dateStr = d.toISOString().split('T')[0];
-        const nextDay = new Date(d);
-        nextDay.setDate(nextDay.getDate() + 1);
-        const nextDateStr = nextDay.toISOString().split('T')[0];
+    // Per-link: try each strategy sequentially
+    const target = String(smartlinkId);
+    for (const pk of ['smartlink_id', 'placement_id', 'id']) {
+        try {
+            const resp = await axios.get(url, {
+                params: { from: dateFrom, to: dateTo, [pk]: target },
+                headers, timeout: 15000,
+            });
+            const items = extractItems(resp.data);
+            const match = findItemById(items, target);
+            if (match) {
+                const mapped = mapStatsFields(match);
+                if (mapped.revenue > 0 || mapped.impressions > 0 || mapped.clicks > 0) {
+                    return mapped;
+                }
+            }
+            // Direct object (aggregated for this specific id)
+            if (resp.data && typeof resp.data === 'object' && !Array.isArray(resp.data) && !resp.data.items && !resp.data.data) {
+                const direct = mapStatsFields(resp.data);
+                if (direct.revenue > 0 || direct.impressions > 0) {
+                    return direct;
+                }
+            }
+        } catch (err) {
+            // silent — try next strategy
+        }
+    }
 
-        const stats = await fetchStatsFromAdsterra(dateStr, nextDateStr, smartlinkId);
-        dailyData.push({
-            date: dateStr,
-            impressions: stats.impressions || 0,
-            clicks: stats.clicks || 0,
-            revenue: stats.revenue || 0,
+    // Last resort: bulk fetch + manual filter
+    try {
+        const resp = await axios.get(url, {
+            params: { from: dateFrom, to: dateTo },
+            headers, timeout: 15000,
         });
+        const items = extractItems(resp.data);
+        const match = findItemById(items, target);
+        if (match) return mapStatsFields(match);
+    } catch (err) {
+        // silent
     }
-    return dailyData;
-};
 
-const mapStatsToMetrics = (rawStats) => ({
-    impressions: rawStats.impressions || 0,
-    clicks: rawStats.clicks || 0,
-    cpm: rawStats.cpm || 0,
-    rpm: rawStats.rpm || 0,
-    revenue: rawStats.revenue || 0,
-});
+    return zeroStats();
+};
 
 // -----------------------------
 // 8. AUTH ENDPOINTS
@@ -367,32 +478,19 @@ app.post('/api/auth/user-login', async (req, res) => {
 app.post('/api/auth/user-signup', async (req, res) => {
     try {
         const { name, email, password } = req.body;
-        if (!name || !email || !password) {
-            return res.status(400).json({ message: 'Name, email, and password are required' });
-        }
-        if (password.length < 6) {
-            return res.status(400).json({ message: 'Password must be at least 6 characters' });
-        }
+        if (!name || !email || !password) return res.status(400).json({ message: 'Name, email, and password are required' });
+        if (password.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' });
 
-        const userRecord = await admin.auth().createUser({
-            email, password, emailVerified: false, disabled: false, displayName: name,
-        });
+        const userRecord = await admin.auth().createUser({ email, password, emailVerified: false, displayName: name });
 
         await db.collection('users').doc(userRecord.uid).set({
-            email,
-            displayName: name,
-            role: 'user',
+            email, displayName: name, role: 'user',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
-            smartlinkId: null,
-            currencyPreference: 'USD',
-            linkCount: 0,
+            smartlinkId: null, currencyPreference: 'USD', linkCount: 0,
         });
 
-        res.status(201).json({
-            message: 'User account created successfully! You can now log in.',
-            uid: userRecord.uid,
-        });
+        res.status(201).json({ message: 'User account created successfully! You can now log in.', uid: userRecord.uid });
     } catch (error) {
         console.error('Signup error:', error);
         if (error.code === 'auth/email-already-exists') {
@@ -403,7 +501,7 @@ app.post('/api/auth/user-signup', async (req, res) => {
 });
 
 // -----------------------------
-// 9. ADMIN ENDPOINTS
+// 9. ADMIN — USERS + LINKS
 // -----------------------------
 app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
     try {
@@ -414,10 +512,8 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
         assignmentsSnapshot.forEach(doc => {
             const data = doc.data();
             assignments[data.smartlinkId] = {
-                userEmail: data.userEmail,
-                userId: data.userId,
-                smartlinkName: data.smartlinkName,
-                claimedBySelf: data.claimedBySelf || false,
+                userEmail: data.userEmail, userId: data.userId,
+                smartlinkName: data.smartlinkName, claimedBySelf: data.claimedBySelf || false,
             };
         });
 
@@ -429,14 +525,13 @@ app.get('/api/admin/smartlinks', authMiddleware('admin'), async (req, res) => {
                 assignedTo: assigned ? assigned.userEmail : null,
                 assignedUserId: assigned ? assigned.userId : null,
                 claimedBySelf: assigned ? assigned.claimedBySelf : false,
-                url: link.url || '',
             };
         });
 
         res.json(smartlinks);
     } catch (error) {
         console.error('Smartlinks fetch error:', error.message);
-        res.status(500).json({ message: 'Failed to fetch real data from Adsterra', error: error.message });
+        res.status(500).json({ message: 'Failed to fetch links', error: error.message });
     }
 });
 
@@ -450,22 +545,15 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
             const data = doc.data();
             const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', doc.id).get();
             const smartlinkNames = [];
-            assignmentsSnapshot.forEach(assignmentDoc => {
-                const assignmentData = assignmentDoc.data();
-                smartlinkNames.push(assignmentData.smartlinkName || assignmentData.smartlinkId);
-            });
+            assignmentsSnapshot.forEach(a => smartlinkNames.push(a.data().smartlinkName || a.data().smartlinkId));
 
             users.push({
-                id: doc.id,
-                email: data.email,
-                displayName: data.displayName || '',
-                role: data.role,
-                permissions: data.permissions || {},
+                id: doc.id, email: data.email, displayName: data.displayName || '',
+                role: data.role, permissions: data.permissions || {},
                 smartlinkId: data.smartlinkId || null,
                 smartlinkName: smartlinkNames.length > 0 ? smartlinkNames.join(', ') : null,
                 assignedLinks: smartlinkNames,
-                linkCount: smartlinkNames.length,
-                maxLinks: MAX_LINKS,
+                linkCount: smartlinkNames.length, maxLinks: MAX_LINKS,
                 currencyPreference: data.currencyPreference || 'USD',
             });
         }
@@ -479,12 +567,8 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
                 u.id.toLowerCase().includes(s)
             );
         }
-
-        if (filter === 'assigned') {
-            users = users.filter(u => u.smartlinkName && u.smartlinkName !== '—' && u.smartlinkName !== null);
-        } else if (filter === 'unassigned') {
-            users = users.filter(u => !u.smartlinkName || u.smartlinkName === '—' || u.smartlinkName === null);
-        }
+        if (filter === 'assigned') users = users.filter(u => u.smartlinkName && u.smartlinkName !== '—');
+        else if (filter === 'unassigned') users = users.filter(u => !u.smartlinkName || u.smartlinkName === '—');
 
         res.json(users);
     } catch (error) {
@@ -500,13 +584,10 @@ app.post('/api/admin/users', authMiddleware('admin'), async (req, res) => {
 
         const userRecord = await admin.auth().createUser({ email, password, emailVerified: false, disabled: false });
         await db.collection('users').doc(userRecord.uid).set({
-            email,
-            role: 'user',
+            email, role: 'user',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             permissions: { impressions: true, clicks: true, cpm: true, rpm: true, revenue: true },
-            smartlinkId: null,
-            currencyPreference: 'USD',
-            linkCount: 0,
+            smartlinkId: null, currencyPreference: 'USD', linkCount: 0,
         });
 
         res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
@@ -530,16 +611,13 @@ app.delete('/api/admin/users/:uid', authMiddleware('admin'), async (req, res) =>
         assignmentsSnapshot.forEach(doc => batch.delete(doc.ref));
         await batch.commit();
 
-        res.json({ message: 'User deleted successfully. Their links are now available.' });
+        res.json({ message: 'User deleted. Their links are now available.' });
     } catch (error) {
-        console.error('Delete user error:', error);
         if (error.code === 'auth/user-not-found') {
             try {
                 await db.collection('users').doc(req.params.uid).delete();
-                return res.json({ message: 'User deleted from Firestore (auth user not found)' });
-            } catch (e) {
-                return res.status(500).json({ message: 'Failed to delete user from Firestore' });
-            }
+                return res.json({ message: 'User deleted from Firestore' });
+            } catch (e) { return res.status(500).json({ message: 'Failed to delete' }); }
         }
         res.status(500).json({ message: 'Failed to delete user' });
     }
@@ -552,17 +630,14 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
 
         const userSnapshot = await db.collection('users').where('email', '==', email).where('role', '==', 'user').get();
         if (userSnapshot.empty) return res.status(404).json({ message: 'User not found' });
-        const userDoc = userSnapshot.docs[0];
-        const uid = userDoc.id;
+        const uid = userSnapshot.docs[0].id;
 
         let linkName = smartlinkId;
         try {
-            const adsterraLinks = await fetchSmartlinksFromAdsterra();
-            const found = adsterraLinks.find(l => l.id == smartlinkId);
-            if (found && found.name) linkName = found.name;
-        } catch (err) {
-            console.warn(`⚠️ Could not fetch name from Adsterra: ${err.message}`);
-        }
+            const links = await fetchSmartlinksFromAdsterra();
+            const found = links.find(l => l.id == smartlinkId);
+            if (found) linkName = found.name;
+        } catch (err) { /* silent */ }
 
         await db.runTransaction(async (transaction) => {
             const assignmentRef = db.collection('assignments').doc(String(smartlinkId));
@@ -570,9 +645,7 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
             if (assignmentDoc.exists) throw new Error('ALREADY_ASSIGNED');
 
             transaction.set(assignmentRef, {
-                userId: uid,
-                userEmail: email,
-                smartlinkId: String(smartlinkId),
+                userId: uid, userEmail: email, smartlinkId: String(smartlinkId),
                 smartlinkName: linkName,
                 assignedAt: admin.firestore.FieldValue.serverTimestamp(),
                 claimedBySelf: false,
@@ -582,10 +655,7 @@ app.post('/api/admin/assign', authMiddleware('admin'), async (req, res) => {
 
         res.json({ message: `Link "${linkName}" assigned successfully` });
     } catch (error) {
-        if (error.message === 'ALREADY_ASSIGNED') {
-            return res.status(400).json({ message: 'Smartlink already assigned' });
-        }
-        console.error('Assign error:', error);
+        if (error.message === 'ALREADY_ASSIGNED') return res.status(400).json({ message: 'Already assigned' });
         res.status(500).json({ message: 'Failed to assign link' });
     }
 });
@@ -601,17 +671,15 @@ app.post('/api/admin/unassign', authMiddleware('admin'), async (req, res) => {
         const uid = assignmentDoc.data().userId;
         await db.collection('assignments').doc(String(smartlinkId)).delete();
 
-        const remainingAssignments = await db.collection('assignments').where('userId', '==', uid).get();
-        if (remainingAssignments.empty) {
+        const remaining = await db.collection('assignments').where('userId', '==', uid).get();
+        if (remaining.empty) {
             await db.collection('users').doc(uid).update({ smartlinkId: null });
         } else {
-            const nextId = remainingAssignments.docs[0].data().smartlinkId;
-            await db.collection('users').doc(uid).update({ smartlinkId: nextId });
+            await db.collection('users').doc(uid).update({ smartlinkId: remaining.docs[0].data().smartlinkId });
         }
 
         res.json({ message: 'Link released back to available pool.' });
     } catch (error) {
-        console.error('Unassign error:', error);
         res.status(500).json({ message: 'Failed to unassign link' });
     }
 });
@@ -627,10 +695,8 @@ app.patch('/api/admin/permissions', authMiddleware('admin'), async (req, res) =>
         const updateData = {};
         updateData[`permissions.${metric}`] = value;
         await db.collection('users').doc(userId).update(updateData);
-
-        res.json({ message: 'Permission updated successfully' });
+        res.json({ message: 'Permission updated' });
     } catch (error) {
-        console.error('Permission update error:', error);
         res.status(500).json({ message: 'Failed to update permission' });
     }
 });
@@ -642,37 +708,27 @@ app.get('/api/admin/fix-names', authMiddleware('admin'), async (req, res) => {
         adsterraLinks.forEach(link => { nameMap[link.id] = link.name; });
 
         const assignmentsSnapshot = await db.collection('assignments').get();
-        let updatedCount = 0;
-        let notFoundCount = 0;
+        let updated = 0, notFound = 0;
         const batch = db.batch();
 
         assignmentsSnapshot.forEach(doc => {
             const data = doc.data();
             const realName = nameMap[data.smartlinkId];
             if (realName && realName !== data.smartlinkName) {
-                batch.update(doc.ref, { smartlinkName: realName });
-                updatedCount++;
-            } else if (!realName) {
-                notFoundCount++;
-            }
+                batch.update(doc.ref, { smartlinkName: realName }); updated++;
+            } else if (!realName) notFound++;
         });
 
         await batch.commit();
-        res.json({
-            message: 'Assignment names fixed successfully!',
-            updated: updatedCount,
-            notFound: notFoundCount,
-            total: assignmentsSnapshot.size,
-        });
+        res.json({ message: 'Names fixed', updated, notFound, total: assignmentsSnapshot.size });
     } catch (error) {
-        console.error('Fix names error:', error);
         res.status(500).json({ message: 'Failed to fix names', error: error.message });
     }
 });
 
-// ================================================================
+// -----------------------------
 // 10. USER — AVAILABLE LINKS + CLAIM
-// ================================================================
+// -----------------------------
 app.get('/api/user/available-links', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -684,22 +740,18 @@ app.get('/api/user/available-links', authMiddleware('user'), async (req, res) =>
 
         const userAssignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
         const claimedCount = userAssignmentsSnapshot.size;
-        const canClaimMore = claimedCount < MAX_LINKS;
 
         const available = adsterraLinks
             .filter(link => !claimedIds.has(String(link.id)))
             .map(link => ({ id: link.id, name: link.name, url: link.url }));
 
         res.json({
-            links: available,
-            count: available.length,
-            claimedCount,
-            maxLinks: MAX_LINKS,
-            canClaimMore,
+            links: available, count: available.length,
+            claimedCount, maxLinks: MAX_LINKS,
+            canClaimMore: claimedCount < MAX_LINKS,
             remaining: Math.max(0, MAX_LINKS - claimedCount),
         });
     } catch (error) {
-        console.error('Available links error:', error);
         res.status(500).json({ message: 'Failed to fetch available links', error: error.message });
     }
 });
@@ -709,7 +761,6 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
         const uid = req.user.uid;
         const email = req.user.email;
         const { smartlinkId } = req.body;
-
         if (!smartlinkId) return res.status(400).json({ message: 'Smartlink ID required' });
 
         const adsterraLinks = await fetchSmartlinksFromAdsterra();
@@ -719,10 +770,7 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
         await db.runTransaction(async (transaction) => {
             const userAssignmentsQuery = db.collection('assignments').where('userId', '==', uid);
             const userAssignmentsSnapshot = await transaction.get(userAssignmentsQuery);
-
-            if (userAssignmentsSnapshot.size >= MAX_LINKS) {
-                throw new Error('MAX_LINKS_REACHED');
-            }
+            if (userAssignmentsSnapshot.size >= MAX_LINKS) throw new Error('MAX_LINKS_REACHED');
 
             const assignmentRef = db.collection('assignments').doc(String(smartlinkId));
             const assignmentDoc = await transaction.get(assignmentRef);
@@ -733,9 +781,7 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
             if (!userDoc.exists) throw new Error('USER_NOT_FOUND');
 
             transaction.set(assignmentRef, {
-                userId: uid,
-                userEmail: email,
-                smartlinkId: String(smartlinkId),
+                userId: uid, userEmail: email, smartlinkId: String(smartlinkId),
                 smartlinkName: link.name,
                 assignedAt: admin.firestore.FieldValue.serverTimestamp(),
                 claimedBySelf: true,
@@ -743,38 +789,66 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
             transaction.update(userRef, { smartlinkId: String(smartlinkId) });
         });
 
-        const finalSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
-        const finalCount = finalSnapshot.size;
+        const finalCount = (await db.collection('assignments').where('userId', '==', uid).get()).size;
 
         res.json({
             message: `Link "${link.name}" claimed successfully!`,
             link: { id: link.id, name: link.name, url: link.url },
-            claimedCount: finalCount,
-            maxLinks: MAX_LINKS,
+            claimedCount: finalCount, maxLinks: MAX_LINKS,
             remaining: Math.max(0, MAX_LINKS - finalCount),
         });
     } catch (error) {
         if (error.message === 'MAX_LINKS_REACHED') {
             return res.status(403).json({
-                message: `You've reached the maximum limit of ${MAX_LINKS} links per user. Contact admin if you need more.`,
-                maxLinks: MAX_LINKS,
-                canClaimMore: false,
+                message: `You've reached the maximum limit of ${MAX_LINKS} links per user.`,
+                maxLinks: MAX_LINKS, canClaimMore: false,
             });
         }
-        if (error.message === 'ALREADY_CLAIMED') {
-            return res.status(409).json({ message: 'This link has already been claimed by another user.' });
-        }
-        if (error.message === 'USER_NOT_FOUND') {
-            return res.status(404).json({ message: 'User not found.' });
-        }
-        console.error('Claim link error:', error);
+        if (error.message === 'ALREADY_CLAIMED') return res.status(409).json({ message: 'Already claimed by another user.' });
+        if (error.message === 'USER_NOT_FOUND') return res.status(404).json({ message: 'User not found.' });
         res.status(500).json({ message: 'Failed to claim link', error: error.message });
     }
 });
 
-// ================================================================
-// 11. USER STATS + ANALYTICS
-// ================================================================
+// -----------------------------
+// 11. AGGREGATED STATS (with USER_SHARE applied)
+// -----------------------------
+/**
+ * Returns user-share (60%) by default. Admin endpoints pass applyShare=false for raw.
+ */
+const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) => {
+    const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+    if (assignmentsSnapshot.empty) return { impressions: 0, clicks: 0, revenue: 0, cpm: 0, rpm: 0 };
+
+    const promises = [];
+    assignmentsSnapshot.forEach(doc => {
+        promises.push(fetchStatsFromAdsterra(dateFrom, dateTo, doc.data().smartlinkId));
+    });
+    const results = await Promise.all(promises);
+
+    let imp = 0, clk = 0, rev = 0, cpmSum = 0, rpmSum = 0, cnt = 0;
+    results.forEach(s => {
+        imp += s.impressions || 0;
+        clk += s.clicks || 0;
+        rev += s.revenue || 0;
+        cpmSum += s.cpm || 0;
+        rpmSum += s.rpm || 0;
+        cnt++;
+    });
+
+    const mult = applyShare ? USER_SHARE : 1;
+    return {
+        impressions: imp,
+        clicks: clk,
+        revenue: rev * mult,
+        cpm: cnt > 0 ? (cpmSum / cnt) * mult : 0,
+        rpm: cnt > 0 ? (rpmSum / cnt) * mult : 0,
+    };
+};
+
+// -----------------------------
+// 12. USER STATS + ANALYTICS (60% shown)
+// -----------------------------
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -785,48 +859,38 @@ app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
         const permissions = userData.permissions || {};
         const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
 
-        // NEW v1.6.0 — Build a single URL map from Adsterra (one API call for all URLs)
-        let urlMap = {};
-        if (!assignmentsSnapshot.empty) {
-            urlMap = await buildAdsterraUrlMap();
-        }
-
         const smartlinks = [];
         if (!assignmentsSnapshot.empty) {
             const today = new Date().toISOString().split('T')[0];
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-            for (const doc of assignmentsSnapshot.docs) {
-                const assignmentData = doc.data();
-                const smartlinkId = String(assignmentData.smartlinkId);
-                const smartlinkName = assignmentData.smartlinkName || smartlinkId;
-                const url = (urlMap[smartlinkId] && urlMap[smartlinkId].url) || '';
+            const promises = [];
+            assignmentsSnapshot.forEach(doc => {
+                const data = doc.data();
+                promises.push(
+                    fetchStatsFromAdsterra(sevenDaysAgo, today, data.smartlinkId).then(stats => ({
+                        id: data.smartlinkId,
+                        name: data.smartlinkName || data.smartlinkId,
+                        metrics: {
+                            impressions: stats.impressions,
+                            clicks: stats.clicks,
+                            cpm: stats.cpm * USER_SHARE,
+                            rpm: stats.rpm * USER_SHARE,
+                            revenue: stats.revenue * USER_SHARE,
+                        },
+                    }))
+                );
+            });
 
-                try {
-                    const rawStats = await fetchStatsFromAdsterra(sevenDaysAgo, today, smartlinkId);
-                    const metrics = mapStatsToMetrics(rawStats);
-                    smartlinks.push({ id: smartlinkId, name: smartlinkName, url, metrics });
-                } catch (error) {
-                    console.warn(`⚠️ Failed stats for link ${smartlinkId}:`, error.message);
-                    smartlinks.push({
-                        id: smartlinkId,
-                        name: smartlinkName,
-                        url,
-                        metrics: { impressions: 0, clicks: 0, cpm: 0, rpm: 0, revenue: 0 },
-                    });
-                }
-            }
+            const results = await Promise.all(promises);
+            results.forEach(r => smartlinks.push(r));
         }
 
         res.json({
-            userEmail: userData.email,
-            permissions,
-            smartlinks,
-            linkCount: smartlinks.length,
-            maxLinks: MAX_LINKS,
+            userEmail: userData.email, permissions, smartlinks,
+            linkCount: smartlinks.length, maxLinks: MAX_LINKS,
         });
     } catch (error) {
-        console.error('User stats error:', error);
         res.status(500).json({ message: 'Failed to fetch user statistics' });
     }
 });
@@ -841,8 +905,7 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
             if (doc.id === currentUid) continue;
             const data = doc.data();
             otherUsers.push({
-                uid: doc.id,
-                email: data.email,
+                uid: doc.id, email: data.email,
                 displayName: data.displayName || data.email.split('@')[0] || 'User',
             });
         }
@@ -850,69 +913,28 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
         const today = new Date().toISOString().split('T')[0];
         const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-        const analytics = [];
-        for (const user of otherUsers) {
+        const analytics = await Promise.all(otherUsers.map(async (user) => {
             const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', user.uid).get();
-            let totalClicks = 0;
+            const promises = [];
+            assignmentsSnapshot.forEach(doc => {
+                promises.push(fetchStatsFromAdsterra(today, tomorrow, doc.data().smartlinkId));
+            });
+            const results = await Promise.all(promises);
+            const totalClicks = results.reduce((sum, s) => sum + (s.clicks || 0), 0);
 
-            if (!assignmentsSnapshot.empty) {
-                for (const doc of assignmentsSnapshot.docs) {
-                    const assignmentData = doc.data();
-                    try {
-                        const rawStats = await fetchStatsFromAdsterra(today, tomorrow, assignmentData.smartlinkId);
-                        totalClicks += rawStats.clicks || 0;
-                    } catch (error) {
-                        console.warn(`⚠️ Analytics stats failed for link ${assignmentData.smartlinkId}:`, error.message);
-                    }
-                }
-            }
-
-            analytics.push({ displayName: user.displayName, email: user.email, totalClicks });
-        }
+            return { displayName: user.displayName, email: user.email, totalClicks };
+        }));
 
         analytics.sort((a, b) => b.totalClicks - a.totalClicks);
         res.json({ users: analytics, updatedAt: new Date().toISOString() });
     } catch (error) {
-        console.error('User analytics error:', error);
         res.status(500).json({ message: 'Failed to fetch user analytics' });
     }
 });
 
-// ================================================================
-// 12. USER GOALS
-// ================================================================
-const getUserAggregatedStats = async (uid, dateFrom, dateTo) => {
-    const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
-    if (assignmentsSnapshot.empty) {
-        return { impressions: 0, clicks: 0, revenue: 0, cpm: 0, rpm: 0 };
-    }
-
-    let totalImpressions = 0, totalClicks = 0, totalRevenue = 0, totalCpm = 0, totalRpm = 0, count = 0;
-
-    for (const doc of assignmentsSnapshot.docs) {
-        const data = doc.data();
-        try {
-            const rawStats = await fetchStatsFromAdsterra(dateFrom, dateTo, data.smartlinkId);
-            totalImpressions += rawStats.impressions || 0;
-            totalClicks += rawStats.clicks || 0;
-            totalRevenue += rawStats.revenue || 0;
-            totalCpm += rawStats.cpm || 0;
-            totalRpm += rawStats.rpm || 0;
-            count++;
-        } catch (error) {
-            console.warn(`⚠️ Goal agg stats failed for link ${data.smartlinkId}:`, error.message);
-        }
-    }
-
-    return {
-        impressions: totalImpressions,
-        clicks: totalClicks,
-        revenue: totalRevenue,
-        cpm: count > 0 ? totalCpm / count : 0,
-        rpm: count > 0 ? totalRpm / count : 0,
-    };
-};
-
+// -----------------------------
+// 13. USER GOALS (60% shown)
+// -----------------------------
 app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -921,7 +943,7 @@ app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
 
         const today = new Date().toISOString().split('T')[0];
         const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-        const currentStats = await getUserAggregatedStats(uid, thirtyDaysAgo, today);
+        const currentStats = await getUserAggregatedStats(uid, thirtyDaysAgo, today, true);
 
         const goals = [];
         goalsSnapshot.forEach(doc => {
@@ -937,12 +959,9 @@ app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
             const progress = target > 0 ? Math.min((current / target) * 100, 100) : 0;
 
             goals.push({
-                id: doc.id,
-                type: data.type,
+                id: doc.id, type: data.type,
                 title: data.title || data.type.charAt(0).toUpperCase() + data.type.slice(1),
-                target: data.target,
-                current,
-                progress,
+                target: data.target, current, progress,
                 deadline: data.deadline || null,
                 createdAt: safeDateToISO(data.createdAt) || new Date().toISOString(),
                 updatedAt: safeDateToISO(data.updatedAt) || new Date().toISOString(),
@@ -951,7 +970,6 @@ app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
 
         res.json({ goals });
     } catch (error) {
-        console.error('Get goals error:', error);
         res.status(500).json({ message: 'Failed to fetch goals', error: error.message });
     }
 });
@@ -960,90 +978,67 @@ app.post('/api/user/goals', authMiddleware('user'), async (req, res) => {
     try {
         const uid = req.user.uid;
         const { type, target, deadline } = req.body;
+        if (!type || !target || target <= 0) return res.status(400).json({ message: 'Invalid goal' });
+        if (!['revenue', 'clicks', 'impressions', 'rpm'].includes(type)) return res.status(400).json({ message: 'Invalid type' });
 
-        if (!type || !target || target <= 0) return res.status(400).json({ message: 'Type and valid target are required.' });
-        if (!['revenue', 'clicks', 'impressions', 'rpm'].includes(type)) {
-            return res.status(400).json({ message: 'Invalid goal type.' });
-        }
-
-        const goalData = {
-            type,
-            target: parseFloat(target),
-            deadline: deadline || null,
+        const docRef = await db.collection('users').doc(uid).collection('goals').add({
+            type, target: parseFloat(target), deadline: deadline || null,
             title: type.charAt(0).toUpperCase() + type.slice(1),
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
-
-        const docRef = await db.collection('users').doc(uid).collection('goals').add(goalData);
-        res.status(201).json({ message: 'Goal created successfully!', goalId: docRef.id });
+        });
+        res.status(201).json({ message: 'Goal created', goalId: docRef.id });
     } catch (error) {
-        console.error('Create goal error:', error);
         res.status(500).json({ message: 'Failed to create goal', error: error.message });
     }
 });
 
 app.put('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
     try {
-        const uid = req.user.uid;
         const { goalId } = req.params;
         const { type, target, deadline } = req.body;
+        if (!goalId || !type || !target || target <= 0) return res.status(400).json({ message: 'Missing fields' });
 
-        if (!goalId) return res.status(400).json({ message: 'Goal ID required.' });
-        if (!type || !target || target <= 0) return res.status(400).json({ message: 'Type and valid target are required.' });
-        if (!['revenue', 'clicks', 'impressions', 'rpm'].includes(type)) {
-            return res.status(400).json({ message: 'Invalid goal type.' });
-        }
-
-        const goalRef = db.collection('users').doc(uid).collection('goals').doc(goalId);
+        const goalRef = db.collection('users').doc(req.user.uid).collection('goals').doc(goalId);
         const goalDoc = await goalRef.get();
-        if (!goalDoc.exists) return res.status(404).json({ message: 'Goal not found.' });
+        if (!goalDoc.exists) return res.status(404).json({ message: 'Goal not found' });
 
         await goalRef.update({
-            type,
-            target: parseFloat(target),
-            deadline: deadline || null,
+            type, target: parseFloat(target), deadline: deadline || null,
             title: type.charAt(0).toUpperCase() + type.slice(1),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-
-        res.json({ message: 'Goal updated successfully!' });
+        res.json({ message: 'Goal updated' });
     } catch (error) {
-        console.error('Update goal error:', error);
         res.status(500).json({ message: 'Failed to update goal', error: error.message });
     }
 });
 
 app.delete('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) => {
     try {
-        const uid = req.user.uid;
         const { goalId } = req.params;
-        if (!goalId) return res.status(400).json({ message: 'Goal ID required.' });
-
-        const goalRef = db.collection('users').doc(uid).collection('goals').doc(goalId);
+        if (!goalId) return res.status(400).json({ message: 'Goal ID required' });
+        const goalRef = db.collection('users').doc(req.user.uid).collection('goals').doc(goalId);
         const goalDoc = await goalRef.get();
-        if (!goalDoc.exists) return res.status(404).json({ message: 'Goal not found.' });
-
+        if (!goalDoc.exists) return res.status(404).json({ message: 'Goal not found' });
         await goalRef.delete();
-        res.json({ message: 'Goal deleted successfully!' });
+        res.json({ message: 'Goal deleted' });
     } catch (error) {
-        console.error('Delete goal error:', error);
-        res.status(500).json({ message: 'Failed to delete goal', error: error.message });
+        res.status(500).json({ message: 'Failed to delete goal' });
     }
 });
 
-// ================================================================
-// 13. USER BALANCE
-// ================================================================
+// -----------------------------
+// 14. USER BALANCE (60% + window info)
+// -----------------------------
 const getUserBalance = async (uid, days = BALANCE_PERIOD_DAYS) => {
     const today = new Date().toISOString().split('T')[0];
     const fromDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-    const stats = await getUserAggregatedStats(uid, fromDate, today);
+    const stats = await getUserAggregatedStats(uid, fromDate, today, true);
     const totalEarned = stats.revenue || 0;
 
     const withdrawalsSnapshot = await db.collection('withdrawalRequests').where('userId', '==', uid).get();
-
     let totalWithdrawn = 0, totalPending = 0, totalProcessing = 0;
     withdrawalsSnapshot.forEach(doc => {
         const d = doc.data();
@@ -1057,93 +1052,73 @@ const getUserBalance = async (uid, days = BALANCE_PERIOD_DAYS) => {
     const availableBalance = Math.max(0, totalEarned - totalWithdrawn - lockedInRequests);
 
     return {
-        totalEarned: Math.round(totalEarned * 100) / 100,
-        totalWithdrawn: Math.round(totalWithdrawn * 100) / 100,
-        totalPending: Math.round(totalPending * 100) / 100,
-        totalProcessing: Math.round(totalProcessing * 100) / 100,
-        lockedInRequests: Math.round(lockedInRequests * 100) / 100,
-        availableBalance: Math.round(availableBalance * 100) / 100,
+        totalEarned: round2(totalEarned),
+        totalWithdrawn: round2(totalWithdrawn),
+        totalPending: round2(totalPending),
+        totalProcessing: round2(totalProcessing),
+        lockedInRequests: round2(lockedInRequests),
+        availableBalance: round2(availableBalance),
         currency: 'USD',
         periodDays: days,
-        periodFrom: fromDate,
-        periodTo: today,
+        periodFrom: fromDate, periodTo: today,
         calculatedAt: new Date().toISOString(),
     };
 };
 
 app.get('/api/user/balance', authMiddleware('user'), async (req, res) => {
     try {
-        const uid = req.user.uid;
         const days = parseInt(req.query.days) || BALANCE_PERIOD_DAYS;
-        const balance = await getUserBalance(uid, days);
-        res.json(balance);
-    } catch (error) {
-        console.error('Balance fetch error:', error);
-        res.status(500).json({
-            message: 'Failed to fetch balance. Please try again.',
-            error: error.message,
+        const balance = await getUserBalance(req.user.uid, days);
+        const nextWindow = getNextWithdrawalWindow();
+
+        res.json({
+            ...balance,
+            withdrawalWindowOpen: isWithdrawalWindowOpen(),
+            nextWithdrawalWindow: nextWindow ? nextWindow.toISOString().split('T')[0] : null,
+            withdrawalWindowDates: WITHDRAWAL_WINDOW_DATES,
+            minWithdrawalUsd: MIN_WITHDRAWAL,
         });
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to fetch balance', error: error.message });
     }
 });
 
-// ================================================================
-// 13B. ADMIN — USER BALANCE WITH PER-LINK BREAKDOWN (v1.6.0: URL added)
-// ================================================================
+// -----------------------------
+// 15. ADMIN — USER BALANCE WITH BREAKDOWN
+// -----------------------------
 const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
     const today = new Date().toISOString().split('T')[0];
     const fromDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
     const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
 
-    // NEW v1.6.0 — URL map
-    let urlMap = {};
-    if (!assignmentsSnapshot.empty) {
-        urlMap = await buildAdsterraUrlMap();
-    }
-
-    const linkPromises = [];
+    // Parallel per-link fetch (RAW)
+    const promises = [];
     assignmentsSnapshot.forEach(doc => {
         const data = doc.data();
-        const sid = String(data.smartlinkId);
-        linkPromises.push(
-            (async () => {
-                const url = (urlMap[sid] && urlMap[sid].url) || '';
-                try {
-                    const rawStats = await fetchStatsFromAdsterra(fromDate, today, sid);
-                    const metrics = mapStatsToMetrics(rawStats);
-                    return {
-                        id: sid,
-                        name: data.smartlinkName || sid,
-                        url,
-                        revenue: metrics.revenue,
-                        clicks: metrics.clicks,
-                        impressions: metrics.impressions,
-                        cpm: metrics.cpm,
-                        rpm: metrics.rpm,
-                        claimedBySelf: data.claimedBySelf || false,
-                        assignedAt: safeDateToISO(data.assignedAt),
-                        error: false,
-                    };
-                } catch (err) {
-                    console.warn(`⚠️ Failed stats for link ${sid}:`, err.message);
-                    return {
-                        id: sid,
-                        name: data.smartlinkName || sid,
-                        url,
-                        revenue: 0, clicks: 0, impressions: 0, cpm: 0, rpm: 0,
-                        claimedBySelf: data.claimedBySelf || false,
-                        assignedAt: safeDateToISO(data.assignedAt),
-                        error: true,
-                    };
-                }
-            })()
+        promises.push(
+            fetchStatsFromAdsterra(fromDate, today, data.smartlinkId).then(stats => ({
+                id: data.smartlinkId,
+                name: data.smartlinkName || data.smartlinkId,
+                url: data.smartlinkUrl || '',
+                rawRevenue: round2(stats.revenue),
+                sharedRevenue: round2(stats.revenue * USER_SHARE),
+                margin: round2(stats.revenue * ADMIN_SHARE),
+                clicks: stats.clicks,
+                impressions: stats.impressions,
+                cpm: round2(stats.cpm),
+                rpm: round2(stats.rpm),
+                claimedBySelf: data.claimedBySelf || false,
+                assignedAt: safeDateToISO(data.assignedAt),
+            }))
         );
     });
 
-    const links = await Promise.all(linkPromises);
-    links.sort((a, b) => (b.revenue || 0) - (a.revenue || 0));
+    const links = await Promise.all(promises);
+    links.sort((a, b) => b.rawRevenue - a.rawRevenue);
 
-    const totalEarned = links.reduce((sum, l) => sum + (l.revenue || 0), 0);
+    const rawTotal = links.reduce((sum, l) => sum + l.rawRevenue, 0);
+    const sharedTotal = rawTotal * USER_SHARE;
 
     const withdrawalsSnapshot = await db.collection('withdrawalRequests').where('userId', '==', uid).get();
     let totalWithdrawn = 0, totalPending = 0, totalProcessing = 0;
@@ -1156,20 +1131,22 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
     });
 
     const lockedInRequests = totalPending + totalProcessing;
-    const availableBalance = Math.max(0, totalEarned - totalWithdrawn - lockedInRequests);
+    const availableBalance = Math.max(0, sharedTotal - totalWithdrawn - lockedInRequests);
 
     return {
-        availableBalance: Math.round(availableBalance * 100) / 100,
-        totalEarned: Math.round(totalEarned * 100) / 100,
-        totalWithdrawn: Math.round(totalWithdrawn * 100) / 100,
-        totalPending: Math.round(totalPending * 100) / 100,
-        totalProcessing: Math.round(totalProcessing * 100) / 100,
-        lockedInRequests: Math.round(lockedInRequests * 100) / 100,
-        currency: 'USD',
-        periodDays: days,
-        periodFrom: fromDate,
-        periodTo: today,
-        calculatedAt: new Date().toISOString(),
+        raw: {
+            totalEarned: round2(rawTotal),
+            platformMarginPotential: round2(rawTotal * ADMIN_SHARE),
+        },
+        user: {
+            totalEarned: round2(sharedTotal),
+            totalWithdrawn: round2(totalWithdrawn),
+            totalPending: round2(totalPending),
+            totalProcessing: round2(totalProcessing),
+            lockedInRequests: round2(lockedInRequests),
+            availableBalance: round2(availableBalance),
+        },
+        period: { days, from: fromDate, to: today },
         links,
         linksCount: links.length,
     };
@@ -1178,65 +1155,172 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
 app.get('/api/admin/user-balance/:uid', authMiddleware('admin'), async (req, res) => {
     try {
         const { uid } = req.params;
-        if (!uid) return res.status(400).json({ message: 'User ID required.' });
-
         const userDoc = await db.collection('users').doc(uid).get();
-        if (!userDoc.exists) return res.status(404).json({ message: 'User not found.' });
+        if (!userDoc.exists) return res.status(404).json({ message: 'User not found' });
 
         const userData = userDoc.data();
         const days = parseInt(req.query.days) || BALANCE_PERIOD_DAYS;
-
-        console.log(`🔄 [ADMIN BALANCE] Fetching for uid=${uid}, days=${days}`);
         const breakdown = await getUserBalanceWithBreakdown(uid, days);
-        console.log(`✅ [ADMIN BALANCE] Done. ${breakdown.linksCount} links, available=$${breakdown.availableBalance}`);
 
         res.json({
             user: {
-                uid,
-                email: userData.email,
+                uid, email: userData.email,
                 displayName: userData.displayName || (userData.email || '').split('@')[0] || 'User',
-                role: userData.role,
-                createdAt: safeDateToISO(userData.createdAt),
+                role: userData.role, createdAt: safeDateToISO(userData.createdAt),
             },
-            balance: {
-                availableBalance: breakdown.availableBalance,
-                totalEarned: breakdown.totalEarned,
-                totalWithdrawn: breakdown.totalWithdrawn,
-                totalPending: breakdown.totalPending,
-                totalProcessing: breakdown.totalProcessing,
-                lockedInRequests: breakdown.lockedInRequests,
-                currency: breakdown.currency,
-                periodDays: breakdown.periodDays,
-                periodFrom: breakdown.periodFrom,
-                periodTo: breakdown.periodTo,
-                calculatedAt: breakdown.calculatedAt,
-            },
+            raw: breakdown.raw,
+            userBalance: breakdown.user,
+            period: breakdown.period,
             links: breakdown.links,
             linksCount: breakdown.linksCount,
             maxLinks: MAX_LINKS,
             canClaimMore: breakdown.linksCount < MAX_LINKS,
         });
     } catch (error) {
-        console.error('❌ Admin user balance error:', error);
-        res.status(500).json({
-            message: 'Failed to fetch user balance',
-            error: error.message,
-        });
+        console.error('Admin user balance error:', error);
+        res.status(500).json({ message: 'Failed to fetch user balance', error: error.message });
     }
 });
 
-// ================================================================
-// 14. USER — WITHDRAWAL REQUESTS
-// ================================================================
+// -----------------------------
+// 16. ADMIN — EARNINGS OVERVIEW (NEW v1.6.0)
+// -----------------------------
+app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res) => {
+    try {
+        const days = parseInt(req.query.days) || 30;
+        const today = new Date().toISOString().split('T')[0];
+        const fromDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+        // Get all users + their assignments
+        const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
+        const assignmentsSnapshot = await db.collection('assignments').get();
+        const withdrawalsSnapshot = await db.collection('withdrawalRequests').get();
+
+        // Build user map
+        const userMap = {};
+        usersSnapshot.forEach(doc => {
+            const d = doc.data();
+            userMap[doc.id] = {
+                uid: doc.id, email: d.email,
+                displayName: d.displayName || (d.email || '').split('@')[0] || 'User',
+            };
+        });
+
+        // Fetch all link stats IN PARALLEL
+        const linkPromises = [];
+        assignmentsSnapshot.forEach(doc => {
+            const d = doc.data();
+            linkPromises.push(
+                fetchStatsFromAdsterra(fromDate, today, d.smartlinkId).then(stats => ({
+                    id: d.smartlinkId,
+                    name: d.smartlinkName || d.smartlinkId,
+                    userId: d.userId,
+                    userEmail: d.userEmail,
+                    userName: userMap[d.userId]?.displayName || 'Unknown',
+                    rawRevenue: round2(stats.revenue),
+                    sharedRevenue: round2(stats.revenue * USER_SHARE),
+                    margin: round2(stats.revenue * ADMIN_SHARE),
+                    clicks: stats.clicks,
+                    impressions: stats.impressions,
+                    error: false,
+                })).catch(() => ({
+                    id: d.smartlinkId, name: d.smartlinkName || d.smartlinkId,
+                    userId: d.userId, userEmail: d.userEmail,
+                    userName: userMap[d.userId]?.displayName || 'Unknown',
+                    rawRevenue: 0, sharedRevenue: 0, margin: 0,
+                    clicks: 0, impressions: 0, error: true,
+                }))
+            );
+        });
+
+        const links = await Promise.all(linkPromises);
+        links.sort((a, b) => b.rawRevenue - a.rawRevenue);
+
+        // Build per-user aggregation
+        const userAgg = {};
+        Object.values(userMap).forEach(u => {
+            userAgg[u.uid] = {
+                uid: u.uid, email: u.email, displayName: u.displayName,
+                rawEarned: 0, sharedEarned: 0,
+                withdrawnApproved: 0, withdrawnPending: 0, withdrawnProcessing: 0,
+                linksCount: 0,
+            };
+        });
+
+        links.forEach(l => {
+            if (userAgg[l.userId]) {
+                userAgg[l.userId].rawEarned += l.rawRevenue;
+                userAgg[l.userId].sharedEarned += l.sharedRevenue;
+                userAgg[l.userId].linksCount++;
+            }
+        });
+
+        withdrawalsSnapshot.forEach(doc => {
+            const d = doc.data();
+            const amt = parseFloat(d.amount) || 0;
+            if (!userAgg[d.userId]) return;
+            if (d.status === 'approved') userAgg[d.userId].withdrawnApproved += amt;
+            else if (d.status === 'pending') userAgg[d.userId].withdrawnPending += amt;
+            else if (d.status === 'processing') userAgg[d.userId].withdrawnProcessing += amt;
+        });
+
+        Object.values(userAgg).forEach(u => {
+            u.rawEarned = round2(u.rawEarned);
+            u.sharedEarned = round2(u.sharedEarned);
+            u.withdrawnApproved = round2(u.withdrawnApproved);
+            u.withdrawnPending = round2(u.withdrawnPending);
+            u.withdrawnProcessing = round2(u.withdrawnProcessing);
+            u.lockedInRequests = round2(u.withdrawnPending + u.withdrawnProcessing);
+            u.availableBalance = round2(Math.max(0, u.sharedEarned - u.withdrawnApproved - u.lockedInRequests));
+        });
+
+        const users = Object.values(userAgg).sort((a, b) => b.rawEarned - a.rawEarned);
+
+        // Totals
+        const totalRaw = links.reduce((sum, l) => sum + l.rawRevenue, 0);
+        const totalShared = links.reduce((sum, l) => sum + l.sharedRevenue, 0);
+        const totalMargin = links.reduce((sum, l) => sum + l.margin, 0);
+        const totalApproved = users.reduce((sum, u) => sum + u.withdrawnApproved, 0);
+        const totalPending = users.reduce((sum, u) => sum + u.withdrawnPending, 0);
+        const totalProcessing = users.reduce((sum, u) => sum + u.withdrawnProcessing, 0);
+        const totalUserBalances = users.reduce((sum, u) => sum + u.availableBalance, 0);
+
+        res.json({
+            period: { days, from: fromDate, to: today },
+            split: { userShare: USER_SHARE, adminShare: ADMIN_SHARE },
+            totals: {
+                rawRevenue: round2(totalRaw),
+                userShownRevenue: round2(totalShared),
+                platformMargin: round2(totalMargin),
+                totalApprovedWithdrawals: round2(totalApproved),
+                totalPendingWithdrawals: round2(totalPending),
+                totalProcessingWithdrawals: round2(totalProcessing),
+                reservedForPayouts: round2(totalPending + totalProcessing),
+                totalUserBalances: round2(totalUserBalances),
+                actualCashInHand: round2(totalRaw - totalApproved),
+                potentialProfit: round2(totalRaw - totalApproved - totalPending - totalProcessing),
+            },
+            links,
+            users,
+            linkCount: links.length,
+            userCount: users.length,
+        });
+    } catch (error) {
+        console.error('Admin earnings overview error:', error);
+        res.status(500).json({ message: 'Failed to fetch earnings overview', error: error.message });
+    }
+});
+
+// -----------------------------
+// 17. USER — WITHDRAWAL REQUESTS
+// -----------------------------
 const WITHDRAWAL_METHODS = ['jazzcash', 'easypaisa', 'bank', 'binance_uid', 'usdt_bep20'];
-const MIN_WITHDRAWAL_USD = 1;
 
 function validateWithdrawalPayload(body) {
     const { amount, method } = body;
-
     const amt = parseFloat(amount);
     if (isNaN(amt) || amt <= 0) return 'Amount must be greater than 0.';
-    if (amt < MIN_WITHDRAWAL_USD) return `Minimum withdrawal amount is $${MIN_WITHDRAWAL_USD}.`;
+    if (amt < MIN_WITHDRAWAL) return `Minimum withdrawal amount is $${MIN_WITHDRAWAL}.`;
     if (!WITHDRAWAL_METHODS.includes(method)) return 'Invalid withdrawal method.';
 
     if (method === 'jazzcash' || method === 'easypaisa') {
@@ -1253,7 +1337,6 @@ function validateWithdrawalPayload(body) {
     if (method === 'usdt_bep20') {
         if (!body.usdtAddress || !String(body.usdtAddress).trim()) return 'USDT (BEP20) address is required.';
     }
-
     return null;
 }
 
@@ -1262,57 +1345,53 @@ app.post('/api/user/withdrawal-request', authMiddleware('user'), async (req, res
         const uid = req.user.uid;
         const email = req.user.email;
 
+        // 1. Window check
+        if (!isWithdrawalWindowOpen()) {
+            const next = getNextWithdrawalWindow();
+            return res.status(403).json({
+                message: `Withdrawals are only allowed on the 14th, 15th, 29th, and 30th of each month. Next window: ${next ? next.toISOString().split('T')[0] : 'N/A'}.`,
+                withdrawalWindowOpen: false,
+                nextWithdrawalWindow: next ? next.toISOString().split('T')[0] : null,
+                withdrawalWindowDates: WITHDRAWAL_WINDOW_DATES,
+            });
+        }
+
+        // 2. Payload validation
         const validationError = validateWithdrawalPayload(req.body);
         if (validationError) return res.status(400).json({ message: validationError });
 
+        // 3. User + balance check
         const userDoc = await db.collection('users').doc(uid).get();
         if (!userDoc.exists) return res.status(404).json({ message: 'User not found.' });
         const userData = userDoc.data();
 
         const requestedAmount = parseFloat(req.body.amount);
-        let balance;
-        try {
-            balance = await getUserBalance(uid);
-        } catch (balanceError) {
-            console.error('⚠️ Balance check failed:', balanceError.message);
-            return res.status(500).json({
-                message: 'Unable to verify your balance right now. Please try again in a moment.',
-            });
-        }
+        const balance = await getUserBalance(uid);
 
         if (balance.availableBalance <= 0) {
             return res.status(400).json({
-                message: `You have no available balance to withdraw. Available: $${balance.availableBalance.toFixed(2)}.`,
+                message: `You have no available balance to withdraw.`,
                 availableBalance: balance.availableBalance,
-                totalEarned: balance.totalEarned,
-                lockedInRequests: balance.lockedInRequests,
             });
         }
-
         if (requestedAmount > balance.availableBalance) {
             return res.status(400).json({
-                message: `Insufficient balance. You requested $${requestedAmount.toFixed(2)} but only $${balance.availableBalance.toFixed(2)} is available.`,
+                message: `Insufficient balance. Available: $${balance.availableBalance.toFixed(2)}.`,
                 availableBalance: balance.availableBalance,
-                totalEarned: balance.totalEarned,
-                lockedInRequests: balance.lockedInRequests,
                 requestedAmount,
             });
         }
 
-        const { amount, method, accountName, accountNumber, iban, binanceUid, usdtAddress } = req.body;
+        const { method, accountName, accountNumber, iban, binanceUid, usdtAddress } = req.body;
 
         const requestData = {
-            userId: uid,
-            userEmail: email,
+            userId: uid, userEmail: email,
             userName: userData.displayName || email.split('@')[0] || 'User',
-            amount: parseFloat(amount),
-            method,
-            status: 'pending',
-            rejectionReason: null,
+            amount: parseFloat(req.body.amount), method,
+            status: 'pending', rejectionReason: null,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            processedBy: null,
-            processedAt: null,
+            processedBy: null, processedAt: null,
             balanceAtRequest: balance.availableBalance,
         };
 
@@ -1338,7 +1417,7 @@ app.post('/api/user/withdrawal-request', authMiddleware('user'), async (req, res
         res.status(201).json({
             message: 'Withdrawal request submitted successfully! Admin will review it soon.',
             requestId: docRef.id,
-            newAvailableBalance: Math.round((balance.availableBalance - requestedAmount) * 100) / 100,
+            newAvailableBalance: round2(balance.availableBalance - requestedAmount),
         });
     } catch (error) {
         console.error('Create withdrawal error:', error);
@@ -1350,30 +1429,20 @@ app.get('/api/user/withdrawal-requests', authMiddleware('user'), async (req, res
     try {
         const uid = req.user.uid;
         const limit = getLimit(req, 100, 200);
-
         const snapshot = await db.collection('withdrawalRequests').where('userId', '==', uid).get();
 
         const requests = [];
         snapshot.forEach(doc => {
             const d = doc.data();
             requests.push({
-                id: doc.id,
-                amount: d.amount,
-                method: d.method,
-                status: d.status,
+                id: doc.id, amount: d.amount, method: d.method, status: d.status,
                 rejectionReason: d.rejectionReason || null,
-                accountName: d.accountName || null,
-                accountNumber: d.accountNumber || null,
-                iban: d.iban || null,
-                bankName: d.bankName || null,
-                binanceUid: d.binanceUid || null,
-                usdtAddress: d.usdtAddress || null,
-                cryptoNetwork: d.cryptoNetwork || null,
-                cryptoType: d.cryptoType || null,
-                createdAt: safeDateToISO(d.createdAt),
-                updatedAt: safeDateToISO(d.updatedAt),
-                processedAt: safeDateToISO(d.processedAt),
-                processedBy: d.processedBy || null,
+                accountName: d.accountName || null, accountNumber: d.accountNumber || null,
+                iban: d.iban || null, bankName: d.bankName || null,
+                binanceUid: d.binanceUid || null, usdtAddress: d.usdtAddress || null,
+                cryptoNetwork: d.cryptoNetwork || null, cryptoType: d.cryptoType || null,
+                createdAt: safeDateToISO(d.createdAt), updatedAt: safeDateToISO(d.updatedAt),
+                processedAt: safeDateToISO(d.processedAt), processedBy: d.processedBy || null,
             });
         });
 
@@ -1385,69 +1454,49 @@ app.get('/api/user/withdrawal-requests', authMiddleware('user'), async (req, res
 
         res.json({ requests: requests.slice(0, limit), count: requests.length });
     } catch (error) {
-        console.error('Fetch withdrawal requests error:', error);
-        res.status(500).json({ message: 'Failed to fetch withdrawal requests', error: error.message });
+        res.status(500).json({ message: 'Failed to fetch withdrawals', error: error.message });
     }
 });
 
-// ================================================================
-// 15. ADMIN — WITHDRAWAL MANAGEMENT
-// ================================================================
+// -----------------------------
+// 18. ADMIN — WITHDRAWAL MANAGEMENT
+// -----------------------------
 app.get('/api/admin/withdrawal-requests', authMiddleware('admin'), async (req, res) => {
     try {
         const status = req.query.status || 'all';
         const limit = getLimit(req, 200, 500);
 
-        console.log(`🔄 [ADMIN WITHDRAWALS] Fetching. Status filter: ${status}`);
-
         const snapshot = await db.collection('withdrawalRequests').get();
-
         const requests = [];
         snapshot.forEach(doc => {
             const d = doc.data();
             requests.push({
-                id: doc.id,
-                userId: d.userId || null,
-                userEmail: d.userEmail || '—',
-                userName: d.userName || '—',
-                amount: d.amount || 0,
-                method: d.method || '—',
-                status: d.status || 'pending',
+                id: doc.id, userId: d.userId || null,
+                userEmail: d.userEmail || '—', userName: d.userName || '—',
+                amount: d.amount || 0, method: d.method || '—', status: d.status || 'pending',
                 rejectionReason: d.rejectionReason || null,
-                accountName: d.accountName || null,
-                accountNumber: d.accountNumber || null,
-                iban: d.iban || null,
-                bankName: d.bankName || null,
-                binanceUid: d.binanceUid || null,
-                usdtAddress: d.usdtAddress || null,
-                cryptoNetwork: d.cryptoNetwork || null,
-                cryptoType: d.cryptoType || null,
-                createdAt: safeDateToISO(d.createdAt),
-                updatedAt: safeDateToISO(d.updatedAt),
-                processedAt: safeDateToISO(d.processedAt),
-                processedBy: d.processedBy || null,
+                accountName: d.accountName || null, accountNumber: d.accountNumber || null,
+                iban: d.iban || null, bankName: d.bankName || null,
+                binanceUid: d.binanceUid || null, usdtAddress: d.usdtAddress || null,
+                cryptoNetwork: d.cryptoNetwork || null, cryptoType: d.cryptoType || null,
+                createdAt: safeDateToISO(d.createdAt), updatedAt: safeDateToISO(d.updatedAt),
+                processedAt: safeDateToISO(d.processedAt), processedBy: d.processedBy || null,
             });
         });
 
         const filtered = status === 'all' ? requests : requests.filter(r => r.status === status);
-
         filtered.sort((a, b) => {
             const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
             const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
             return bt - at;
         });
 
-        console.log(`✅ [ADMIN WITHDRAWALS] Returning ${filtered.length}/${requests.length} (filter=${status})`);
-
         res.json({
             requests: filtered.slice(0, limit),
-            count: filtered.length,
-            totalCount: requests.length,
-            filter: status,
+            count: filtered.length, totalCount: requests.length, filter: status,
         });
     } catch (error) {
-        console.error('❌ [ADMIN WITHDRAWALS] Fetch error:', error);
-        res.status(500).json({ message: 'Failed to fetch withdrawal requests', error: error.message });
+        res.status(500).json({ message: 'Failed to fetch withdrawals', error: error.message });
     }
 });
 
@@ -1461,55 +1510,43 @@ app.patch('/api/admin/withdrawal-requests/:id', authMiddleware('admin'), async (
             return res.status(400).json({ message: 'Invalid status.' });
         }
         if (status === 'rejected' && (!rejectionReason || !String(rejectionReason).trim())) {
-            return res.status(400).json({ message: 'Rejection reason is required when rejecting.' });
+            return res.status(400).json({ message: 'Rejection reason required.' });
         }
 
         const requestRef = db.collection('withdrawalRequests').doc(id);
         const requestDoc = await requestRef.get();
-        if (!requestDoc.exists) return res.status(404).json({ message: 'Withdrawal request not found.' });
+        if (!requestDoc.exists) return res.status(404).json({ message: 'Request not found.' });
 
         const updateData = {
             status,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             processedBy: req.user.email,
             processedAt: admin.firestore.FieldValue.serverTimestamp(),
+            rejectionReason: status === 'rejected' ? String(rejectionReason).trim() : null,
         };
 
-        if (status === 'rejected') {
-            updateData.rejectionReason = String(rejectionReason).trim();
-        } else {
-            updateData.rejectionReason = null;
-        }
-
         await requestRef.update(updateData);
-        console.log(`✅ [ADMIN] Withdrawal ${id} → ${status}`);
-
-        res.json({ message: `Withdrawal request marked as "${status}".` });
+        res.json({ message: `Withdrawal marked as "${status}".` });
     } catch (error) {
-        console.error('Update withdrawal status error:', error);
-        res.status(500).json({ message: 'Failed to update withdrawal request', error: error.message });
+        res.status(500).json({ message: 'Failed to update withdrawal', error: error.message });
     }
 });
 
-// ================================================================
-// 16. USER — LIVE CHAT
-// ================================================================
+// -----------------------------
+// 19. USER — LIVE CHAT
+// -----------------------------
 app.get('/api/user/chat/messages', authMiddleware('user'), async (req, res) => {
     try {
         const userEmail = req.user.email;
         const limit = getLimit(req, 100, 300);
-
         const snapshot = await db.collection('chatMessages').where('userEmail', '==', userEmail).get();
 
         const messages = [];
         snapshot.forEach(doc => {
             const d = doc.data();
             messages.push({
-                id: doc.id,
-                fromRole: d.fromRole,
-                fromEmail: d.fromEmail,
-                message: d.message,
-                read: d.read || false,
+                id: doc.id, fromRole: d.fromRole, fromEmail: d.fromEmail,
+                message: d.message, read: d.read || false,
                 createdAt: safeDateToISO(d.createdAt),
             });
         });
@@ -1522,8 +1559,7 @@ app.get('/api/user/chat/messages', authMiddleware('user'), async (req, res) => {
 
         res.json({ messages: messages.slice(-limit), total: messages.length });
     } catch (error) {
-        console.error('User chat fetch error:', error);
-        res.status(500).json({ message: 'Failed to fetch chat messages', error: error.message });
+        res.status(500).json({ message: 'Failed to fetch messages', error: error.message });
     }
 });
 
@@ -1531,62 +1567,43 @@ app.post('/api/user/chat/send', authMiddleware('user'), async (req, res) => {
     try {
         const userEmail = req.user.email;
         const { message } = req.body;
-
-        if (!message || !String(message).trim()) {
-            return res.status(400).json({ message: 'Message cannot be empty.' });
-        }
-        if (String(message).length > 2000) {
-            return res.status(400).json({ message: 'Message too long (max 2000 chars).' });
-        }
+        if (!message || !String(message).trim()) return res.status(400).json({ message: 'Message empty.' });
+        if (String(message).length > 2000) return res.status(400).json({ message: 'Too long (max 2000).' });
 
         const docRef = await db.collection('chatMessages').add({
-            userEmail,
-            userId: req.user.uid,
-            fromRole: 'user',
-            fromEmail: userEmail,
-            message: String(message).trim(),
-            read: false,
+            userEmail, userId: req.user.uid,
+            fromRole: 'user', fromEmail: userEmail,
+            message: String(message).trim(), read: false,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-
         res.status(201).json({ message: 'Message sent.', messageId: docRef.id });
     } catch (error) {
-        console.error('User chat send error:', error);
-        res.status(500).json({ message: 'Failed to send message', error: error.message });
+        res.status(500).json({ message: 'Failed to send', error: error.message });
     }
 });
 
 app.patch('/api/user/chat/read', authMiddleware('user'), async (req, res) => {
     try {
-        const userEmail = req.user.email;
-
         const snapshot = await db.collection('chatMessages')
-            .where('userEmail', '==', userEmail)
+            .where('userEmail', '==', req.user.email)
             .where('fromRole', '==', 'admin')
-            .where('read', '==', false)
-            .get();
+            .where('read', '==', false).get();
 
         const batch = db.batch();
         snapshot.forEach(doc => batch.update(doc.ref, { read: true }));
         await batch.commit();
-
-        res.json({ message: 'Marked as read', count: snapshot.size });
+        res.json({ message: 'Marked read', count: snapshot.size });
     } catch (error) {
-        console.error('User chat read error:', error);
-        res.status(500).json({ message: 'Failed to mark messages as read', error: error.message });
+        res.status(500).json({ message: 'Failed to mark read', error: error.message });
     }
 });
 
-// ================================================================
-// 17. ADMIN — LIVE CHAT
-// ================================================================
+// -----------------------------
+// 20. ADMIN — LIVE CHAT
+// -----------------------------
 app.get('/api/admin/chat/users', authMiddleware('admin'), async (req, res) => {
     try {
-        console.log('🔄 [ADMIN CHAT] Fetching chat threads...');
-
         const snapshot = await db.collection('chatMessages').get();
-        console.log(`  → ${snapshot.size} total chat messages in DB`);
-
         const threadsMap = {};
         let totalUnread = 0;
 
@@ -1594,20 +1611,15 @@ app.get('/api/admin/chat/users', authMiddleware('admin'), async (req, res) => {
             const d = doc.data();
             const email = d.userEmail;
             if (!email) return;
-
             const ts = d.createdAt ? d.createdAt.toDate().getTime() : 0;
             const isUnread = d.fromRole === 'user' && !d.read;
-
             if (isUnread) totalUnread++;
 
             if (!threadsMap[email]) {
                 threadsMap[email] = {
-                    userEmail: email,
-                    userName: email.split('@')[0],
-                    lastMessage: d.message,
-                    lastMessageAt: ts,
-                    lastFromRole: d.fromRole,
-                    unreadCount: isUnread ? 1 : 0,
+                    userEmail: email, userName: email.split('@')[0],
+                    lastMessage: d.message, lastMessageAt: ts,
+                    lastFromRole: d.fromRole, unreadCount: isUnread ? 1 : 0,
                 };
             } else {
                 if (isUnread) threadsMap[email].unreadCount++;
@@ -1621,9 +1633,8 @@ app.get('/api/admin/chat/users', authMiddleware('admin'), async (req, res) => {
 
         const emails = Object.keys(threadsMap);
         if (emails.length > 0) {
-            const chunkSize = 10;
-            for (let i = 0; i < emails.length; i += chunkSize) {
-                const chunk = emails.slice(i, i + chunkSize);
+            for (let i = 0; i < emails.length; i += 10) {
+                const chunk = emails.slice(i, i + 10);
                 try {
                     const usersSnapshot = await db.collection('users').where('email', 'in', chunk).get();
                     usersSnapshot.forEach(userDoc => {
@@ -1632,40 +1643,30 @@ app.get('/api/admin/chat/users', authMiddleware('admin'), async (req, res) => {
                             threadsMap[ud.email].userName = ud.displayName || ud.email.split('@')[0];
                         }
                     });
-                } catch (enrichErr) {
-                    console.warn('⚠️ Enrichment chunk failed:', enrichErr.message);
-                }
+                } catch (err) { /* silent */ }
             }
         }
 
         const threads = Object.values(threadsMap).sort((a, b) => b.lastMessageAt - a.lastMessageAt);
-
-        console.log(`✅ [ADMIN CHAT] ${threads.length} threads, ${totalUnread} unread`);
-
         res.json({ threads, totalUnread, totalThreads: threads.length });
     } catch (error) {
-        console.error('❌ [ADMIN CHAT] Fetch threads error:', error);
-        res.status(500).json({ message: 'Failed to fetch chat threads', error: error.message });
+        res.status(500).json({ message: 'Failed to fetch threads', error: error.message });
     }
 });
 
 app.get('/api/admin/chat/messages/:userEmail', authMiddleware('admin'), async (req, res) => {
     try {
         const userEmail = decodeURIComponent(req.params.userEmail);
-        if (!userEmail) return res.status(400).json({ message: 'User email required.' });
+        if (!userEmail) return res.status(400).json({ message: 'Email required.' });
         const limit = getLimit(req, 100, 300);
 
         const snapshot = await db.collection('chatMessages').where('userEmail', '==', userEmail).get();
-
         const messages = [];
         snapshot.forEach(doc => {
             const d = doc.data();
             messages.push({
-                id: doc.id,
-                fromRole: d.fromRole,
-                fromEmail: d.fromEmail,
-                message: d.message,
-                read: d.read || false,
+                id: doc.id, fromRole: d.fromRole, fromEmail: d.fromEmail,
+                message: d.message, read: d.read || false,
                 createdAt: safeDateToISO(d.createdAt),
             });
         });
@@ -1678,7 +1679,6 @@ app.get('/api/admin/chat/messages/:userEmail', authMiddleware('admin'), async (r
 
         res.json({ messages: messages.slice(-limit), total: messages.length });
     } catch (error) {
-        console.error('Admin chat messages error:', error);
         res.status(500).json({ message: 'Failed to fetch messages', error: error.message });
     }
 });
@@ -1686,121 +1686,116 @@ app.get('/api/admin/chat/messages/:userEmail', authMiddleware('admin'), async (r
 app.post('/api/admin/chat/send', authMiddleware('admin'), async (req, res) => {
     try {
         const { userEmail, message } = req.body;
-        if (!userEmail || !String(userEmail).trim()) {
-            return res.status(400).json({ message: 'User email required.' });
-        }
-        if (!message || !String(message).trim()) {
-            return res.status(400).json({ message: 'Message cannot be empty.' });
-        }
-        if (String(message).length > 2000) {
-            return res.status(400).json({ message: 'Message too long (max 2000 chars).' });
-        }
+        if (!userEmail || !String(userEmail).trim()) return res.status(400).json({ message: 'Email required.' });
+        if (!message || !String(message).trim()) return res.status(400).json({ message: 'Message empty.' });
+        if (String(message).length > 2000) return res.status(400).json({ message: 'Too long.' });
 
         const userSnapshot = await db.collection('users')
             .where('email', '==', String(userEmail).trim())
-            .where('role', '==', 'user')
-            .get();
-        if (userSnapshot.empty) {
-            return res.status(404).json({ message: 'User not found.' });
-        }
+            .where('role', '==', 'user').get();
+        if (userSnapshot.empty) return res.status(404).json({ message: 'User not found.' });
 
         const docRef = await db.collection('chatMessages').add({
             userEmail: String(userEmail).trim(),
             userId: userSnapshot.docs[0].id,
-            fromRole: 'admin',
-            fromEmail: req.user.email,
-            message: String(message).trim(),
-            read: false,
+            fromRole: 'admin', fromEmail: req.user.email,
+            message: String(message).trim(), read: false,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-
         res.status(201).json({ message: 'Message sent.', messageId: docRef.id });
     } catch (error) {
-        console.error('Admin chat send error:', error);
-        res.status(500).json({ message: 'Failed to send message', error: error.message });
+        res.status(500).json({ message: 'Failed to send', error: error.message });
     }
 });
 
 app.patch('/api/admin/chat/read/:userEmail', authMiddleware('admin'), async (req, res) => {
     try {
         const userEmail = decodeURIComponent(req.params.userEmail);
-        if (!userEmail) return res.status(400).json({ message: 'User email required.' });
+        if (!userEmail) return res.status(400).json({ message: 'Email required.' });
 
         const snapshot = await db.collection('chatMessages')
             .where('userEmail', '==', userEmail)
             .where('fromRole', '==', 'user')
-            .where('read', '==', false)
-            .get();
+            .where('read', '==', false).get();
 
         const batch = db.batch();
         snapshot.forEach(doc => batch.update(doc.ref, { read: true }));
         await batch.commit();
-
-        res.json({ message: 'Marked as read', count: snapshot.size });
+        res.json({ message: 'Marked read', count: snapshot.size });
     } catch (error) {
-        console.error('Admin chat read error:', error);
-        res.status(500).json({ message: 'Failed to mark as read', error: error.message });
+        res.status(500).json({ message: 'Failed to mark read', error: error.message });
     }
 });
 
-// ================================================================
-// 18. LEADERBOARD
-// ================================================================
+// -----------------------------
+// 21. LEADERBOARD (60% shown)
+// -----------------------------
 app.get('/api/leaderboard', authMiddleware('user'), async (req, res) => {
     try {
         const { period = 'week' } = req.query;
-
         const today = new Date();
         const todayStr = today.toISOString().split('T')[0];
         const fromDate = new Date(today);
         if (period === 'week') fromDate.setDate(fromDate.getDate() - 7);
         else if (period === 'month') fromDate.setDate(fromDate.getDate() - 30);
-        else return res.status(400).json({ message: 'Invalid period. Use "week" or "month".' });
-
+        else return res.status(400).json({ message: 'Invalid period' });
         const fromStr = fromDate.toISOString().split('T')[0];
 
         const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
         if (usersSnapshot.empty) return res.json({ users: [] });
 
-        const leaderboardData = [];
-        for (const userDoc of usersSnapshot.docs) {
+        const leaderboardData = await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
             const userData = userDoc.data();
             const uid = userDoc.id;
-
             const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
-            if (assignmentsSnapshot.empty) continue;
+            if (assignmentsSnapshot.empty) return null;
 
-            let totalRevenue = 0;
-            const statsPromises = [];
+            const promises = [];
             assignmentsSnapshot.forEach(doc => {
-                const data = doc.data();
-                statsPromises.push(fetchStatsFromAdsterra(fromStr, todayStr, data.smartlinkId));
+                promises.push(fetchStatsFromAdsterra(fromStr, todayStr, doc.data().smartlinkId));
             });
+            const results = await Promise.all(promises);
+            const rawTotal = results.reduce((sum, s) => sum + (s.revenue || 0), 0);
 
-            const statsResults = await Promise.all(statsPromises);
-            statsResults.forEach(stats => { totalRevenue += stats.revenue || 0; });
-
-            leaderboardData.push({
-                uid,
-                email: userData.email,
+            return {
+                uid, email: userData.email,
                 displayName: userData.displayName || userData.email.split('@')[0] || 'User',
-                revenue: totalRevenue,
-            });
-        }
+                revenue: round2(rawTotal * USER_SHARE),
+            };
+        }));
 
-        leaderboardData.sort((a, b) => b.revenue - a.revenue);
-        const topUsers = leaderboardData.slice(0, 20);
-
-        res.json({ period, from: fromStr, to: todayStr, users: topUsers });
+        const filtered = leaderboardData.filter(Boolean).sort((a, b) => b.revenue - a.revenue);
+        res.json({ period, from: fromStr, to: todayStr, users: filtered.slice(0, 20) });
     } catch (error) {
-        console.error('Leaderboard error:', error);
         res.status(500).json({ message: 'Failed to fetch leaderboard', error: error.message });
     }
 });
 
-// ================================================================
-// 19. CHART DATA
-// ================================================================
+// -----------------------------
+// 22. CHART DATA
+// -----------------------------
+const fetchDailyStatsForLink = async (smartlinkId, days = 7) => {
+    const dailyData = [];
+    const now = new Date();
+    for (let i = days - 1; i >= 0; i--) {
+        const d = new Date(now);
+        d.setDate(d.getDate() - i);
+        const dateStr = d.toISOString().split('T')[0];
+        const nextDay = new Date(d);
+        nextDay.setDate(nextDay.getDate() + 1);
+        const nextDateStr = nextDay.toISOString().split('T')[0];
+
+        const stats = await fetchStatsFromAdsterra(dateStr, nextDateStr, smartlinkId);
+        dailyData.push({
+            date: dateStr,
+            impressions: stats.impressions || 0,
+            clicks: stats.clicks || 0,
+            revenue: stats.revenue || 0,
+        });
+    }
+    return dailyData;
+};
+
 const aggregateDailyStats = async (linkIds, days) => {
     const dailyMap = {};
     const now = new Date();
@@ -1811,7 +1806,7 @@ const aggregateDailyStats = async (linkIds, days) => {
         dailyMap[dateStr] = { date: dateStr, impressions: 0, clicks: 0, revenue: 0 };
     }
 
-    for (const linkId of linkIds) {
+    await Promise.all(linkIds.map(async (linkId) => {
         try {
             const dailyStats = await fetchDailyStatsForLink(linkId, days);
             dailyStats.forEach(day => {
@@ -1821,10 +1816,8 @@ const aggregateDailyStats = async (linkIds, days) => {
                     dailyMap[day.date].revenue += day.revenue;
                 }
             });
-        } catch (err) {
-            console.warn(`Failed daily stats for link ${linkId}:`, err.message);
-        }
-    }
+        } catch (err) { /* silent */ }
+    }));
 
     const sortedDates = Object.keys(dailyMap).sort();
     return sortedDates.map(date => dailyMap[date]);
@@ -1833,7 +1826,7 @@ const aggregateDailyStats = async (linkIds, days) => {
 app.get('/api/admin/chart-data', authMiddleware('admin'), async (req, res) => {
     try {
         const days = parseInt(req.query.days) || 7;
-        if (days < 1 || days > 90) return res.status(400).json({ message: 'Days must be between 1 and 90' });
+        if (days < 1 || days > 90) return res.status(400).json({ message: 'Days 1-90' });
 
         const allLinks = await fetchSmartlinksFromAdsterra();
         const linkIds = allLinks.map(l => l.id);
@@ -1844,25 +1837,22 @@ app.get('/api/admin/chart-data', authMiddleware('admin'), async (req, res) => {
             labels: dailyData.map(d => d.date),
             impressions: dailyData.map(d => d.impressions),
             clicks: dailyData.map(d => d.clicks),
-            revenue: dailyData.map(d => d.revenue),
+            revenue: dailyData.map(d => d.revenue), // RAW — admin
         });
     } catch (error) {
-        console.error('Admin chart data error:', error);
-        res.status(500).json({ message: 'Failed to fetch chart data', error: error.message });
+        res.status(500).json({ message: 'Failed chart data', error: error.message });
     }
 });
 
 app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
     try {
         const days = parseInt(req.query.days) || 7;
-        if (days < 1 || days > 90) return res.status(400).json({ message: 'Days must be between 1 and 90' });
+        if (days < 1 || days > 90) return res.status(400).json({ message: 'Days 1-90' });
 
-        const uid = req.user.uid;
-        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
+        const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', req.user.uid).get();
         const linkIds = [];
         assignmentsSnapshot.forEach(doc => {
-            const data = doc.data();
-            if (data.smartlinkId) linkIds.push(data.smartlinkId);
+            if (doc.data().smartlinkId) linkIds.push(doc.data().smartlinkId);
         });
 
         if (linkIds.length === 0) return res.json({ labels: [], impressions: [], clicks: [], revenue: [] });
@@ -1872,47 +1862,38 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
             labels: dailyData.map(d => d.date),
             impressions: dailyData.map(d => d.impressions),
             clicks: dailyData.map(d => d.clicks),
-            revenue: dailyData.map(d => d.revenue),
+            revenue: dailyData.map(d => round2(d.revenue * USER_SHARE)), // 60% shown
         });
     } catch (error) {
-        console.error('User chart data error:', error);
-        res.status(500).json({ message: 'Failed to fetch chart data', error: error.message });
+        res.status(500).json({ message: 'Failed chart data', error: error.message });
     }
 });
 
 // -----------------------------
-// 20. ROOT / HEALTH CHECK
+// 23. ROOT
 // -----------------------------
 app.get('/api', (req, res) => {
     res.json({
         name: 'Lunar Metrics API',
         version: '1.6.0',
         status: 'operational',
-        features: [
-            'auth',
-            'adsterra-smartlinks',
-            'admin-users',
-            'admin-links',
-            'user-stats',
-            'user-stats-with-url',            // NEW v1.6.0
-            'user-analytics',
-            'goals',
-            'leaderboard',
-            'chart-data',
-            'self-service-claiming',
-            'claim-limit-10',
-            'withdrawals',
-            'live-chat',
-            'balance',
-            'balance-validated-withdrawals',
-            'crypto-split-methods',
-            'admin-user-balance-breakdown',
-        ],
+        split: { userShare: USER_SHARE, adminShare: ADMIN_SHARE },
         limits: {
             maxLinksPerUser: MAX_LINKS,
+            minWithdrawalUsd: MIN_WITHDRAWAL,
+            withdrawalWindowDates: WITHDRAWAL_WINDOW_DATES,
             balanceLookbackDays: BALANCE_PERIOD_DAYS,
-            minWithdrawalUsd: MIN_WITHDRAWAL_USD,
         },
+        features: [
+            'auth', 'adsterra-smartlinks', 'admin-users', 'admin-links',
+            'user-stats', 'user-analytics', 'goals', 'leaderboard', 'chart-data',
+            'self-service-claiming', 'claim-limit-10',
+            'withdrawals', 'withdrawal-windows-14-15-29-30', 'min-withdrawal-15',
+            'live-chat', 'balance', 'balance-validated-withdrawals',
+            'crypto-split-methods', 'admin-user-balance-breakdown',
+            'admin-earnings-overview', 'revenue-split-60-40',
+            'adsterra-stats-fallback',
+        ],
         timestamp: new Date().toISOString(),
     });
 });
