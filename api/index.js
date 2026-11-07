@@ -1,14 +1,19 @@
 // ============================================
-// LUNAR METRICS · MASTER BACKEND (v1.6.0)
+// LUNAR METRICS · MASTER BACKEND (v1.6.1)
 // ============================================
-// v1.6.0 CHANGES:
-//   ✅ Stats API fix — 3 fallback strategies (smartlink_id → placement_id → bulk manual filter)
-//   ✅ 60/40 revenue split — USER_SHARE = 0.60 (user sees 60%, admin margin 40% hidden)
+// v1.6.1 HOTFIX:
+//   🔧 Adsterra stats.json — fixed params
+//      OLD: from / to + smartlink_id  → 422 error
+//      NEW: start_date / finish_date + bulk fetch + manual filter
+//   🔧 Test endpoint updated to show correct usage
+//
+// v1.6.0 FEATURES (unchanged):
+//   ✅ 60/40 revenue split (USER_SHARE = 0.60)
 //   ✅ Min withdrawal = $15
-//   ✅ Withdrawal windows — only 14/15 and 29/30 of each month
-//   ✅ Admin earnings overview — per-link actual vs shown vs margin + all user balances
-//   ✅ New debug endpoint /api/test-adsterra-stats
-//   ✅ Parallel Adsterra calls (Promise.all) for speed
+//   ✅ Withdrawal windows — 14/15 and 29/30 of each month
+//   ✅ Admin earnings overview + per-user balance breakdown
+//   ✅ Max 10 links per user
+//   ✅ Crypto split (binance_uid / usdt_bep20)
 // ============================================
 
 const express = require('express');
@@ -122,20 +127,15 @@ const isWithdrawalWindowOpen = (date = new Date()) => {
 };
 
 const getNextWithdrawalWindow = (date = new Date()) => {
-    const day = date.getDate();
-    const year = date.getFullYear();
-    const month = date.getMonth();
+    const y = date.getFullYear();
+    const m = date.getMonth();
     const candidates = [];
-
-    [0, 1].forEach(monthOffset => {
+    [0, 1].forEach(offset => {
         [14, 15, 29, 30].forEach(d => {
-            const candidate = new Date(year, month + monthOffset, d);
-            if (candidate.getDate() === d && candidate > date) {
-                candidates.push(candidate);
-            }
+            const c = new Date(y, m + offset, d);
+            if (c.getDate() === d && c > date) candidates.push(c);
         });
     });
-
     candidates.sort((a, b) => a - b);
     return candidates[0] || null;
 };
@@ -175,7 +175,7 @@ app.get('/api/test', (req, res) => {
     res.json({
         status: 'ok',
         message: 'CORS is working! Backend is reachable.',
-        version: '1.6.0',
+        version: '1.6.1',
         timestamp: new Date().toISOString(),
     });
 });
@@ -207,8 +207,9 @@ app.get('/api/test-adsterra', async (req, res) => {
 });
 
 /**
- * NEW v1.6.0: Debug endpoint for stats API
- * Shows raw response from Adsterra stats.json with different params.
+ * v1.6.1: Debug endpoint — uses CORRECT Adsterra params
+ * Adsterra stats.json requires: start_date + finish_date (NOT from/to)
+ * Filtering by smartlink is done MANUALLY (in-memory) after bulk fetch.
  */
 app.get('/api/test-adsterra-stats', async (req, res) => {
     const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
@@ -221,43 +222,55 @@ app.get('/api/test-adsterra-stats', async (req, res) => {
     const testSmartlinkId = req.query.smartlink_id || null;
 
     const results = {
+        apiVersion: 'v1.6.1',
         dateRange: { from: dateFrom, to: dateTo },
+        note: 'Adsterra uses start_date/finish_date, NOT from/to. Filtering by smartlink done in-memory.',
         tests: {},
     };
 
-    // Test 1: no filter (total)
+    // Test 1: Correct params — bulk fetch
+    try {
+        const resp = await axios.get(url, {
+            params: { start_date: dateFrom, finish_date: dateTo },
+            headers, timeout: 15000,
+        });
+        const items = extractItems(resp.data);
+        results.tests.bulkFetch = {
+            status: resp.status,
+            itemCount: items.length,
+            sample: items.slice(0, 3),
+            rawShape: Array.isArray(resp.data) ? 'array' : (resp.data?.data ? 'nested-data' : 'object'),
+        };
+        if (testSmartlinkId) {
+            const match = findItemById(items, testSmartlinkId);
+            results.tests.filteredById = {
+                searchingFor: testSmartlinkId,
+                found: !!match,
+                data: match || null,
+                mapped: match ? mapStatsFields(match) : zeroStats(),
+            };
+        }
+    } catch (err) {
+        results.tests.bulkFetch = {
+            error: err.message,
+            response: err.response?.data,
+            status: err.response?.status,
+        };
+    }
+
+    // Test 2: Also try old params to double-check
     try {
         const resp = await axios.get(url, {
             params: { from: dateFrom, to: dateTo },
             headers, timeout: 15000,
         });
-        results.tests.noFilter = {
-            status: resp.status,
-            itemCount: extractItems(resp.data).length,
-            sample: extractItems(resp.data).slice(0, 3),
-            rawShape: Array.isArray(resp.data) ? 'array' : (resp.data?.data ? 'nested-data' : 'object'),
-        };
+        results.tests.oldParams = { status: resp.status, itemCount: extractItems(resp.data).length };
     } catch (err) {
-        results.tests.noFilter = { error: err.message, response: err.response?.data, status: err.response?.status };
-    }
-
-    // Test 2: with smartlink_id (if provided)
-    if (testSmartlinkId) {
-        for (const pk of ['smartlink_id', 'placement_id', 'id']) {
-            try {
-                const resp = await axios.get(url, {
-                    params: { from: dateFrom, to: dateTo, [pk]: testSmartlinkId },
-                    headers, timeout: 15000,
-                });
-                results.tests[pk] = {
-                    status: resp.status,
-                    itemCount: extractItems(resp.data).length,
-                    raw: resp.data,
-                };
-            } catch (err) {
-                results.tests[pk] = { error: err.message, response: err.response?.data, status: err.response?.status };
-            }
-        }
+        results.tests.oldParams = {
+            error: err.message,
+            response: err.response?.data,
+            status: err.response?.status,
+        };
     }
 
     res.json({ success: true, ...results });
@@ -295,9 +308,13 @@ const mapStatsFields = (item) => {
 const findItemById = (items, id) => {
     if (!Array.isArray(items)) return null;
     const target = String(id);
-    return items.find(item =>
-        String(item.smart_link_id ?? item.placement_id ?? item.id ?? '') === target
-    ) || null;
+    return items.find(item => {
+        const candidates = [
+            item.smart_link_id, item.smartlink_id, item.placement_id,
+            item.id, item.link_id, item.placement, item.smartlink,
+        ];
+        return candidates.some(c => c !== undefined && c !== null && String(c) === target);
+    }) || null;
 };
 
 const aggregateItems = (items) => {
@@ -356,74 +373,45 @@ const fetchSmartlinksFromAdsterra = async () => {
 };
 
 /**
- * v1.6.0: Robust stats fetcher with 3 fallback strategies.
+ * v1.6.1 CRITICAL FIX:
+ * Adsterra stats.json requires: start_date + finish_date (NOT from/to)
+ * No filter params accepted for smartlink — we fetch ALL and filter in-memory.
  */
 const fetchStatsFromAdsterra = async (dateFrom, dateTo, smartlinkId = null) => {
     const baseUrl = (ADSTERRA_BASE_URL || 'https://api3.adsterratools.com/publisher/').replace(/\/?$/, '/');
     const url = `${baseUrl}stats.json`;
     const headers = { 'X-API-Key': ADSTERRA_API_KEY, 'Accept': 'application/json' };
 
-    // No filter — return aggregate total
-    if (!smartlinkId) {
-        try {
-            const resp = await axios.get(url, {
-                params: { from: dateFrom, to: dateTo },
-                headers, timeout: 15000,
-            });
-            const items = extractItems(resp.data);
+    // CORRECT params — Adsterra expects start_date / finish_date
+    const params = { start_date: dateFrom, finish_date: dateTo };
+
+    try {
+        const resp = await axios.get(url, { params, headers, timeout: 15000 });
+        const items = extractItems(resp.data);
+
+        // If no filter → return aggregate
+        if (!smartlinkId) {
             if (items.length > 0) return aggregateItems(items);
             if (resp.data && typeof resp.data === 'object' && !Array.isArray(resp.data)) {
                 const direct = mapStatsFields(resp.data);
-                if (direct.revenue || direct.impressions) return direct;
+                if (direct.revenue || direct.impressions || direct.clicks) return direct;
             }
-        } catch (err) {
-            console.warn('Stats (total) failed:', err.message);
+            return zeroStats();
         }
+
+        // Filter in-memory by smartlink ID
+        const match = findItemById(items, smartlinkId);
+        if (match) {
+            return mapStatsFields(match);
+        }
+
+        // Nothing matched — return zero
+        console.warn(`⚠️ No stats found for smartlink ${smartlinkId} in date range ${dateFrom} to ${dateTo}`);
+        return zeroStats();
+    } catch (error) {
+        console.error(`❌ Stats fetch error for ${smartlinkId || 'total'}:`, error.response?.data || error.message);
         return zeroStats();
     }
-
-    // Per-link: try each strategy sequentially
-    const target = String(smartlinkId);
-    for (const pk of ['smartlink_id', 'placement_id', 'id']) {
-        try {
-            const resp = await axios.get(url, {
-                params: { from: dateFrom, to: dateTo, [pk]: target },
-                headers, timeout: 15000,
-            });
-            const items = extractItems(resp.data);
-            const match = findItemById(items, target);
-            if (match) {
-                const mapped = mapStatsFields(match);
-                if (mapped.revenue > 0 || mapped.impressions > 0 || mapped.clicks > 0) {
-                    return mapped;
-                }
-            }
-            // Direct object (aggregated for this specific id)
-            if (resp.data && typeof resp.data === 'object' && !Array.isArray(resp.data) && !resp.data.items && !resp.data.data) {
-                const direct = mapStatsFields(resp.data);
-                if (direct.revenue > 0 || direct.impressions > 0) {
-                    return direct;
-                }
-            }
-        } catch (err) {
-            // silent — try next strategy
-        }
-    }
-
-    // Last resort: bulk fetch + manual filter
-    try {
-        const resp = await axios.get(url, {
-            params: { from: dateFrom, to: dateTo },
-            headers, timeout: 15000,
-        });
-        const items = extractItems(resp.data);
-        const match = findItemById(items, target);
-        if (match) return mapStatsFields(match);
-    } catch (err) {
-        // silent
-    }
-
-    return zeroStats();
 };
 
 // -----------------------------
@@ -811,11 +799,8 @@ app.post('/api/user/claim-link', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 11. AGGREGATED STATS (with USER_SHARE applied)
+// 11. AGGREGATED STATS (with USER_SHARE)
 // -----------------------------
-/**
- * Returns user-share (60%) by default. Admin endpoints pass applyShare=false for raw.
- */
 const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) => {
     const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
     if (assignmentsSnapshot.empty) return { impressions: 0, clicks: 0, revenue: 0, cpm: 0, rpm: 0 };
@@ -847,7 +832,7 @@ const getUserAggregatedStats = async (uid, dateFrom, dateTo, applyShare = true) 
 };
 
 // -----------------------------
-// 12. USER STATS + ANALYTICS (60% shown)
+// 12. USER STATS + ANALYTICS
 // -----------------------------
 app.get('/api/user/stats', authMiddleware('user'), async (req, res) => {
     try {
@@ -933,7 +918,7 @@ app.get('/api/user/analytics', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 13. USER GOALS (60% shown)
+// 13. USER GOALS
 // -----------------------------
 app.get('/api/user/goals', authMiddleware('user'), async (req, res) => {
     try {
@@ -1029,7 +1014,7 @@ app.delete('/api/user/goals/:goalId', authMiddleware('user'), async (req, res) =
 });
 
 // -----------------------------
-// 14. USER BALANCE (60% + window info)
+// 14. USER BALANCE
 // -----------------------------
 const getUserBalance = async (uid, days = BALANCE_PERIOD_DAYS) => {
     const today = new Date().toISOString().split('T')[0];
@@ -1084,7 +1069,7 @@ app.get('/api/user/balance', authMiddleware('user'), async (req, res) => {
 });
 
 // -----------------------------
-// 15. ADMIN — USER BALANCE WITH BREAKDOWN
+// 15. ADMIN — USER BALANCE BREAKDOWN
 // -----------------------------
 const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
     const today = new Date().toISOString().split('T')[0];
@@ -1092,7 +1077,6 @@ const getUserBalanceWithBreakdown = async (uid, days = BALANCE_PERIOD_DAYS) => {
 
     const assignmentsSnapshot = await db.collection('assignments').where('userId', '==', uid).get();
 
-    // Parallel per-link fetch (RAW)
     const promises = [];
     assignmentsSnapshot.forEach(doc => {
         const data = doc.data();
@@ -1183,7 +1167,7 @@ app.get('/api/admin/user-balance/:uid', authMiddleware('admin'), async (req, res
 });
 
 // -----------------------------
-// 16. ADMIN — EARNINGS OVERVIEW (NEW v1.6.0)
+// 16. ADMIN — EARNINGS OVERVIEW
 // -----------------------------
 app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res) => {
     try {
@@ -1191,12 +1175,10 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
         const today = new Date().toISOString().split('T')[0];
         const fromDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-        // Get all users + their assignments
         const usersSnapshot = await db.collection('users').where('role', '==', 'user').get();
         const assignmentsSnapshot = await db.collection('assignments').get();
         const withdrawalsSnapshot = await db.collection('withdrawalRequests').get();
 
-        // Build user map
         const userMap = {};
         usersSnapshot.forEach(doc => {
             const d = doc.data();
@@ -1206,7 +1188,6 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
             };
         });
 
-        // Fetch all link stats IN PARALLEL
         const linkPromises = [];
         assignmentsSnapshot.forEach(doc => {
             const d = doc.data();
@@ -1236,7 +1217,6 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
         const links = await Promise.all(linkPromises);
         links.sort((a, b) => b.rawRevenue - a.rawRevenue);
 
-        // Build per-user aggregation
         const userAgg = {};
         Object.values(userMap).forEach(u => {
             userAgg[u.uid] = {
@@ -1276,7 +1256,6 @@ app.get('/api/admin/earnings-overview', authMiddleware('admin'), async (req, res
 
         const users = Object.values(userAgg).sort((a, b) => b.rawEarned - a.rawEarned);
 
-        // Totals
         const totalRaw = links.reduce((sum, l) => sum + l.rawRevenue, 0);
         const totalShared = links.reduce((sum, l) => sum + l.sharedRevenue, 0);
         const totalMargin = links.reduce((sum, l) => sum + l.margin, 0);
@@ -1345,7 +1324,6 @@ app.post('/api/user/withdrawal-request', authMiddleware('user'), async (req, res
         const uid = req.user.uid;
         const email = req.user.email;
 
-        // 1. Window check
         if (!isWithdrawalWindowOpen()) {
             const next = getNextWithdrawalWindow();
             return res.status(403).json({
@@ -1356,11 +1334,9 @@ app.post('/api/user/withdrawal-request', authMiddleware('user'), async (req, res
             });
         }
 
-        // 2. Payload validation
         const validationError = validateWithdrawalPayload(req.body);
         if (validationError) return res.status(400).json({ message: validationError });
 
-        // 3. User + balance check
         const userDoc = await db.collection('users').doc(uid).get();
         if (!userDoc.exists) return res.status(404).json({ message: 'User not found.' });
         const userData = userDoc.data();
@@ -1728,7 +1704,7 @@ app.patch('/api/admin/chat/read/:userEmail', authMiddleware('admin'), async (req
 });
 
 // -----------------------------
-// 21. LEADERBOARD (60% shown)
+// 21. LEADERBOARD
 // -----------------------------
 app.get('/api/leaderboard', authMiddleware('user'), async (req, res) => {
     try {
@@ -1837,7 +1813,7 @@ app.get('/api/admin/chart-data', authMiddleware('admin'), async (req, res) => {
             labels: dailyData.map(d => d.date),
             impressions: dailyData.map(d => d.impressions),
             clicks: dailyData.map(d => d.clicks),
-            revenue: dailyData.map(d => d.revenue), // RAW — admin
+            revenue: dailyData.map(d => d.revenue),
         });
     } catch (error) {
         res.status(500).json({ message: 'Failed chart data', error: error.message });
@@ -1862,7 +1838,7 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
             labels: dailyData.map(d => d.date),
             impressions: dailyData.map(d => d.impressions),
             clicks: dailyData.map(d => d.clicks),
-            revenue: dailyData.map(d => round2(d.revenue * USER_SHARE)), // 60% shown
+            revenue: dailyData.map(d => round2(d.revenue * USER_SHARE)),
         });
     } catch (error) {
         res.status(500).json({ message: 'Failed chart data', error: error.message });
@@ -1875,7 +1851,7 @@ app.get('/api/user/chart-data', authMiddleware('user'), async (req, res) => {
 app.get('/api', (req, res) => {
     res.json({
         name: 'Lunar Metrics API',
-        version: '1.6.0',
+        version: '1.6.1',
         status: 'operational',
         split: { userShare: USER_SHARE, adminShare: ADMIN_SHARE },
         limits: {
@@ -1892,7 +1868,7 @@ app.get('/api', (req, res) => {
             'live-chat', 'balance', 'balance-validated-withdrawals',
             'crypto-split-methods', 'admin-user-balance-breakdown',
             'admin-earnings-overview', 'revenue-split-60-40',
-            'adsterra-stats-fallback',
+            'adsterra-stats-fixed-v1.6.1',
         ],
         timestamp: new Date().toISOString(),
     });
